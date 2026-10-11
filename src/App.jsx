@@ -12,7 +12,12 @@ import { Trash2, Lock, X, ChevronDown, ChevronRight, Star, Flag, Plus } from "lu
 import { storage } from "./storage";
 
 // v0.1.0: 初版（プラザ2の形式＋指示書§4のエンジン＋本店用パーサー）
-export const APP_VERSION = "0.1.0";
+// v0.2.0: イベントの対象機種を登録できるように。
+//   ①イベント名ごとの「いつもの対象機種」（slot-event-targets-v1）
+//   ②日付×イベントごとの「その日の対象機種」（slot-date-event-targets-v1、3×3のように毎回違う機種用）
+//   予想日の対象機種は🎯で表示し、エンジンに「イベント対象機種」「対象機種があるイベントで対象外」の
+//   パターンを追加（効くかどうかは他のパターンと同じく実測で点数化、n<15は0pt）。
+export const APP_VERSION = "0.2.0";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -28,6 +33,8 @@ export const KEYS = {
   aliases: "slot-model-aliases-v1",
   noModel: "slot-no-model-map-v1",
   gtype: "slot-model-gtype-v1",
+  eventTargets: "slot-event-targets-v1", // { イベント名: [機種名...] }（いつも同じ対象機種）
+  dateEventTargets: "slot-date-event-targets-v1", // { 日付: { イベント名: [機種名...] } }（その日の対象機種）
 };
 export const RAW_PREFIX = "slot-raw-fulltable-v1:week:";
 export const RAW_INDEX = "slot-raw-fulltable-index-v1";
@@ -343,6 +350,16 @@ export function gtypeOfEntry(entry) {
   return null;
 }
 
+// その日の「イベント名 → 対象機種キーの集合」。いつもの対象機種＋その日の対象機種を合わせる。
+export function eventTargetsOn(date, eventNames, eventTargets, dateEventTargets, resolve) {
+  const out = new Map();
+  eventNames.forEach((E) => {
+    const names = [...((eventTargets || {})[E] || []), ...(((dateEventTargets || {})[date] || {})[E] || [])];
+    if (names.length) out.set(E, new Set(names.map(resolve)));
+  });
+  return out;
+}
+
 // =============================================================================
 // エンジン（指示書 §4）
 // =============================================================================
@@ -440,6 +457,7 @@ export function buildSymbolContext(pageDays, opts) {
   const eventsOn = o.eventsOn || (() => []);
   const isStrong = o.isStrong || (() => false);
   const isSemi = o.isSemi || (() => false);
+  const targetsOn = o.targetsOn || (() => new Map()); // date -> Map(イベント名 -> Set(機種キー))
   const dates = pageDays.map((d) => d.date);
   const modelCtx = new Map();
   const getModelCtx = (mk) => {
@@ -481,7 +499,7 @@ export function buildSymbolContext(pageDays, opts) {
   const p80 = quantile(readingsForPct, 0.8);
   // 記号（§4-2）：読み取りの階層（p20/p50/p80）× 差枚
   machines.forEach((m) => m.recs.forEach((r) => { r.sym = classifySymbol(r, { p20, p50, p80 }); }));
-  return { dates, machines, p20, p50, p80, eventsOn, isStrong, isSemi, modelCtx, sampleCount: readingsForPct.length };
+  return { dates, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length };
 }
 export function classifySymbol(r, p) {
   if (!r.enough || r.reading === null || p.p20 === null || r.s === null || r.s === undefined) return "－";
@@ -556,6 +574,15 @@ export function patternKeysAt(ctx, m, i, target) {
     });
   } else add("noEvent", "通常日（イベント無し）");
   if (ctx.isStrong(target)) add("strongDay", "強いイベント当日");
+  // イベント対象機種（v0.2.0）
+  const tgMap = ctx.targetsOn ? ctx.targetsOn(target) : new Map();
+  if (tgMap.size) {
+    const hitEvents = [...tgMap.entries()].filter(([, set]) => set.has(m.modelKey)).map(([E]) => E);
+    if (hitEvents.length) {
+      add("evTarget", "イベント対象機種（予想日）");
+      hitEvents.forEach((E) => add(`evTarget:${E}`, `「${E}」の対象機種`));
+    } else add("evNotTarget", "対象機種があるイベントで対象外");
+  }
   // 自己平均比ローテーション（好調）
   if (i >= 9) {
     const all = r.slice(0, i + 1).map((x) => x.s).filter((v) => v !== null && v !== undefined);
@@ -632,7 +659,8 @@ export function scoreSymbolPickupToday(ctx, learned, closedSet) {
     });
     const points = items.reduce((a, it) => a + it.points, 0);
     items.sort((a, b) => Math.abs(b.points) - Math.abs(a.points));
-    list.push({ key: m.key, no: m.no, model: m.model, points, grade: symbolPointsToGrade(points), items, lastSym: m.recs[i].sym, lastExp: m.recs[i].exp });
+    const tg = ctx.targetsOn ? [...ctx.targetsOn(target).entries()].filter(([, set]) => set.has(m.modelKey)).map(([E]) => E) : [];
+    list.push({ key: m.key, no: m.no, model: m.model, targetEvents: tg, points, grade: symbolPointsToGrade(points), items, lastSym: m.recs[i].sym, lastExp: m.recs[i].exp });
   });
   list.sort((a, b) => b.points - a.points || a.no - b.no);
   return { target, lastDate: ctx.dates[lastDi], list };
@@ -680,6 +708,7 @@ function joinNames(list) {
 const KV_DEFAULTS = {
   [KEYS.pages]: [], [KEYS.eventNames]: [], [KEYS.strong]: [], [KEYS.semi]: [], [KEYS.closed]: [],
   [KEYS.dateEvent]: {}, [KEYS.undo]: [], [KEYS.aliases]: {}, [KEYS.noModel]: {}, [KEYS.gtype]: {},
+  [KEYS.eventTargets]: {}, [KEYS.dateEventTargets]: {},
 };
 const NO_EVENT_LABEL = "イベント無し";
 const SYMBOL_COLORS = { "☆": "#e5484d", "〇": "#f2d24b", "▽": "#9ece6a", "□": "#7aa2f7", "×": "#5a6272", "－": "#2f3644" };
@@ -758,6 +787,28 @@ function Collapse({ title, defaultOpen = false, children, right }) {
         {right}
       </div>
       {open && <div style={{ marginTop: 10 }}>{children}</div>}
+    </div>
+  );
+}
+
+// 機種名を1つずつ追加・削除するチップ入力（イベント対象機種用）
+function ModelChips({ names, onAdd, onRemove, placeholder }) {
+  const [v, setV] = useState("");
+  const add = () => { const t = v.trim(); if (!t) return; onAdd(t); setV(""); };
+  return (
+    <div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
+        {names.map((n) => (
+          <span key={n} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, background: "rgba(232,179,76,0.10)", border: "1px solid #3a3320", borderRadius: 999, padding: "2px 6px 2px 8px" }}>
+            🎯 {n}<button onClick={() => onRemove(n)} style={{ background: "none", border: "none", color: "#5a6272", cursor: "pointer", padding: 0, display: "flex" }}><X size={10} /></button>
+          </span>
+        ))}
+        {!names.length && <span style={{ fontSize: 11, color: "#5a6272" }}>対象機種なし</span>}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input list="model-names" value={v} onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} placeholder={placeholder || "機種名を入力して追加"} style={{ ...S.input, flex: 1, fontSize: 12, padding: "5px 8px" }} />
+        <button style={S.ghost} onClick={add}>追加</button>
+      </div>
     </div>
   );
 }
@@ -899,8 +950,12 @@ export default function App() {
   const semiNames = useMemo(() => new Set(kv[KEYS.semi].map((s) => s.name)), [kv]);
   const resolve = useMemo(() => makeResolver(aliases), [aliases]);
   const eventsOn = useCallback((d) => splitNames(dateEvent[d]), [dateEvent]);
+  const eventTargets = kv[KEYS.eventTargets];
+  const dateEventTargets = kv[KEYS.dateEventTargets];
   const isStrong = useCallback((d) => eventsOn(d).some((n) => strongNames.has(n)), [eventsOn, strongNames]);
   const isSemi = useCallback((d) => !isStrong(d) && eventsOn(d).some((n) => semiNames.has(n)), [eventsOn, isStrong, semiNames]);
+  const targetsOn = useCallback((d) => eventTargetsOn(d, eventsOn(d), eventTargets, dateEventTargets, resolve), [eventsOn, eventTargets, dateEventTargets, resolve]);
+  const isTargetOn = useCallback((d, modelKey) => [...targetsOn(d).values()].some((set) => set.has(modelKey)), [targetsOn]);
   const rawDates = useMemo(() => Object.keys(raw).sort(), [raw]);
   const ovrDates = useMemo(() => Object.keys(ovr).sort(), [ovr]);
   const allDays = useMemo(() => rawDates.map((date) => ({
@@ -1116,17 +1171,49 @@ export default function App() {
   const [evStatus, setEvStatus] = useState(null);
   const [tierName, setTierName] = useState("");
   const [closedDate, setClosedDate] = useState(todayStr());
+  const [evTargets, setEvTargets] = useState([]); // 登録フォームで一緒に登録する「その日の対象機種」
+  const [editTarget, setEditTarget] = useState(null); // { date, name } 一覧から対象機種を編集中
+  const [fixedEvName, setFixedEvName] = useState("");
+  const addUniqueName = (list, n) => (list.some((x) => resolve(x) === resolve(n)) ? list : [...list, n]);
+
+  async function setDateTargets(date, E, updater) {
+    return commitKV(KEYS.dateEventTargets, (prev) => {
+      const day = { ...((prev || {})[date] || {}) };
+      const list = updater(day[E] || []);
+      if (list.length) day[E] = list; else delete day[E];
+      const next = { ...(prev || {}) };
+      if (Object.keys(day).length) next[date] = day; else delete next[date];
+      return next;
+    });
+  }
+  async function setFixedTargets(E, updater) {
+    return commitKV(KEYS.eventTargets, (prev) => {
+      const next = { ...(prev || {}) };
+      const list = updater(next[E] || []);
+      if (list.length) next[E] = list; else delete next[E];
+      return next;
+    });
+  }
 
   async function addEvent() {
     const name = evName.trim();
     if (!evDate || !name) { setEvStatus({ type: "error", msg: "日付とイベント名を入力してください。" }); return; }
     const cur = splitNames(kvRef.current[KEYS.dateEvent][evDate]);
-    if (cur.includes(name)) { setEvStatus({ type: "error", msg: "すでに登録されています。" }); return; }
-    const r = await commitKV(KEYS.dateEvent, (prev) => ({ ...prev, [evDate]: joinNames([...cur, name]) }));
-    if (!r.ok) { setEvStatus({ type: "error", msg: `保存に失敗しました：${r.error}` }); return; }
-    if (!kvRef.current[KEYS.eventNames].includes(name)) await commitKV(KEYS.eventNames, (prev) => [...prev, name]);
-    setEvStatus({ type: "ok", msg: `${evDate} に「${name}」を登録しました。` });
+    const exists = cur.includes(name);
+    if (exists && !evTargets.length) { setEvStatus({ type: "error", msg: "すでに登録されています（対象機種を足す時は、機種を入れてから登録を押してください）。" }); return; }
+    if (!exists) {
+      const r = await commitKV(KEYS.dateEvent, (prev) => ({ ...prev, [evDate]: joinNames([...cur, name]) }));
+      if (!r.ok) { setEvStatus({ type: "error", msg: `保存に失敗しました：${r.error}` }); return; }
+      if (!kvRef.current[KEYS.eventNames].includes(name)) await commitKV(KEYS.eventNames, (prev) => [...prev, name]);
+    }
+    if (evTargets.length) {
+      const r2 = await setDateTargets(evDate, name, (list) => evTargets.reduce(addUniqueName, list));
+      if (!r2.ok) { setEvStatus({ type: "error", msg: `対象機種の保存に失敗しました：${r2.error}` }); return; }
+    }
+    const fixed = (kvRef.current[KEYS.eventTargets][name] || []).length;
+    setEvStatus({ type: "ok", msg: `${evDate} に「${name}」を${exists ? "更新" : "登録"}しました${evTargets.length ? `（その日の対象機種${evTargets.length}機種）` : ""}${fixed ? `。いつもの対象機種${fixed}機種も自動で対象になります` : ""}。` });
     setEvName("");
+    setEvTargets([]);
     setEvDate(addDays(evDate, 1));
   }
   async function removeEvent(date, name) {
@@ -1216,6 +1303,8 @@ export default function App() {
       modelAliases: aliases,
       noModelMap: noModel,
       modelGTypes: gtypes,
+      eventTargets,
+      dateEventTargets,
     };
     const blob = new Blob([JSON.stringify(obj)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -1240,6 +1329,7 @@ export default function App() {
       const kvPairs = [
         [KEYS.pages, obj.pages], [KEYS.eventNames, obj.eventNames], [KEYS.strong, obj.strongEvents], [KEYS.semi, obj.semiEvents],
         [KEYS.closed, obj.closedDays], [KEYS.dateEvent, obj.dateEventMap], [KEYS.aliases, obj.modelAliases], [KEYS.noModel, obj.noModelMap], [KEYS.gtype, obj.modelGTypes],
+        [KEYS.eventTargets, obj.eventTargets], [KEYS.dateEventTargets, obj.dateEventTargets],
       ];
       for (const [k, v] of kvPairs) if (v !== undefined) { const r = await commitKV(k, () => v); if (!r.ok) throw new Error(r.error); }
       if (obj.rawFullTable && obj.rawFullTableFormat === "packed-v1") await bulkWriteWeekly("raw", obj.rawFullTable);
@@ -1291,11 +1381,11 @@ export default function App() {
   }, [viewMode, currentPage, pageNameKeys, allDays, resolve, displayNameOf]);
   const engine = useMemo(() => {
     if (!pageDays.length) return null;
-    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi });
+    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn });
     const learned = learnSymbolPatternWeights(ctx);
     const pick = scoreSymbolPickupToday(ctx, learned, closedSet);
     return { ctx, learned, pick };
-  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, closedSet]);
+  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet]);
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
   const machineLabel = (m) => (isMultiModel ? `${m.model} ${m.no}番` : `${m.no}番`);
 
@@ -1390,7 +1480,7 @@ export default function App() {
           <tr key={m.key}>
             <td title={machineLabel(m)} style={{ ...S.td, position: "sticky", left: 0, background: "#1b212b", color: "#c7cbd4", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>{machineLabel(m)}</td>
             {gridDates.map((d) => { const r = recAt(m, d); return (
-              <td key={d} className="mono" title={r ? `G${fmt(r.g)} 差枚${fmtSigned(r.s)} BB${r.bb ?? "-"} RB${r.rb ?? "-"}${r.src === "m" ? "（代用）" : ""}` : ""} style={{ ...S.td, textAlign: "center", color: r ? SYMBOL_COLORS[r.sym] : "#2a323f", fontWeight: 700, textDecoration: r && r.src === "m" ? "underline dotted" : undefined }}>{r ? r.sym : "・"}</td>
+              <td key={d} className="mono" title={r ? `G${fmt(r.g)} 差枚${fmtSigned(r.s)} BB${r.bb ?? "-"} RB${r.rb ?? "-"}${r.src === "m" ? "（代用）" : ""}` : ""} style={{ ...S.td, textAlign: "center", color: r ? SYMBOL_COLORS[r.sym] : "#2a323f", fontWeight: 700, textDecoration: r && r.src === "m" ? "underline dotted" : undefined, background: isTargetOn(d, m.modelKey) ? "rgba(232,179,76,0.13)" : undefined }}>{r ? r.sym : "・"}</td>
             ); })}
           </tr>
         ))}</tbody>
@@ -1597,18 +1687,37 @@ export default function App() {
                     <input list="event-names" value={evName} onChange={(e) => setEvName(e.target.value)} placeholder="イベント名" style={{ ...S.input, flex: "1 1 120px" }} />
                     <button onClick={addEvent} style={S.btn("#7aa2f7")}>登録</button>
                   </div>
+                  <div style={{ fontSize: 11, color: "#8b93a3", margin: "2px 0 4px" }}>この日の対象機種（任意・3×3のように毎回違う機種の時）</div>
+                  <ModelChips names={evTargets} onAdd={(n) => setEvTargets((l) => addUniqueName(l, n))} onRemove={(n) => setEvTargets((l) => l.filter((x) => x !== n))} />
+                  {evName.trim() && (eventTargets[evName.trim()] || []).length > 0 && <div style={{ fontSize: 11, color: "#e8b34c", marginTop: 4 }}>「{evName.trim()}」のいつもの対象機種：{eventTargets[evName.trim()].join("、")}（自動で対象）</div>}
                   <Status s={evStatus} />
-                  <div className="scrollbar" style={{ maxHeight: 200, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
+                  <div style={{ fontSize: 11, color: "#5a6272", margin: "10px 0 4px" }}>登録済み（イベント名を押すと、その日の対象機種を編集できます）</div>
+                  <div className="scrollbar" style={{ maxHeight: 340, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
                     {Object.keys(dateEvent).sort().reverse().map((d) => (
-                      <div key={d} style={S.row}>
-                        <span className="mono" style={{ color: "#7aa2f7" }}>{d}</span>
-                        <span style={{ display: "flex", flexWrap: "wrap", gap: 4, flex: 1 }}>
-                          {splitNames(dateEvent[d]).map((n) => (
-                            <span key={n} style={{ background: "#1b212b", borderRadius: 4, padding: "1px 6px", display: "inline-flex", gap: 4, alignItems: "center" }}>
-                              {n}<button onClick={() => removeEvent(d, n)} style={{ background: "none", border: "none", color: "#5a6272", cursor: "pointer", padding: 0 }}><X size={10} /></button>
-                            </span>
-                          ))}
-                        </span>
+                      <div key={d} style={{ ...S.row, flexDirection: "column", alignItems: "stretch" }}>
+                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                          <span className="mono" style={{ color: "#7aa2f7" }}>{d}</span>
+                          <span style={{ display: "flex", flexWrap: "wrap", gap: 4, flex: 1 }}>
+                            {splitNames(dateEvent[d]).map((n) => {
+                              const dayT = ((dateEventTargets[d] || {})[n] || []).length;
+                              const fixT = (eventTargets[n] || []).length;
+                              const editing = editTarget && editTarget.date === d && editTarget.name === n;
+                              return (
+                                <span key={n} style={{ background: editing ? "#2a2416" : "#1b212b", borderRadius: 4, padding: "1px 6px", display: "inline-flex", gap: 4, alignItems: "center" }}>
+                                  <span style={{ cursor: "pointer" }} onClick={() => setEditTarget(editing ? null : { date: d, name: n })}>{n}{dayT + fixT > 0 && <span style={{ color: "#e8b34c" }}> 🎯{dayT + fixT}</span>}</span>
+                                  <button onClick={() => removeEvent(d, n)} style={{ background: "none", border: "none", color: "#5a6272", cursor: "pointer", padding: 0 }}><X size={10} /></button>
+                                </span>
+                              );
+                            })}
+                          </span>
+                        </div>
+                        {editTarget && editTarget.date === d && splitNames(dateEvent[d]).includes(editTarget.name) && (
+                          <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px dashed #2a323f" }}>
+                            <div style={{ fontSize: 11, color: "#8b93a3", marginBottom: 4 }}>{d}「{editTarget.name}」のその日の対象機種</div>
+                            <ModelChips names={(dateEventTargets[d] || {})[editTarget.name] || []} onAdd={(n) => setDateTargets(d, editTarget.name, (l) => addUniqueName(l, n))} onRemove={(n) => setDateTargets(d, editTarget.name, (l) => l.filter((x) => x !== n))} />
+                            {(eventTargets[editTarget.name] || []).length > 0 && <div style={{ fontSize: 11, color: "#e8b34c", marginTop: 4 }}>＋いつもの対象機種：{eventTargets[editTarget.name].join("、")}</div>}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -1630,6 +1739,22 @@ export default function App() {
                   </div>
                   {[...kv[KEYS.closed]].sort((a, b) => b.date.localeCompare(a.date)).map((c) => <div key={c.date} style={{ ...S.row, marginBottom: 4 }}><span className="mono">{c.date}　休</span><button style={S.ghost} onClick={() => removeClosed(c.date)}><Trash2 size={11} /></button></div>)}
                 </div>
+              </div>
+
+              <div style={S.card}>
+                <div style={S.h}>🎯 いつも同じ対象機種のイベント</div>
+                <div style={S.note}>「このイベントはこの機種」と決まっているイベントは、ここでイベント名に対象機種を1回登録すれば、そのイベントの日は毎回自動で対象になります。毎回違う機種のイベント（3×3など）は、📅イベント登録の方で日付ごとに入れてください。</div>
+                <input list="event-names" value={fixedEvName} onChange={(e) => setFixedEvName(e.target.value)} placeholder="イベント名を入力（または選択）" style={{ ...S.input, width: "100%", marginBottom: 8 }} />
+                {fixedEvName.trim() && (
+                  <div style={{ marginBottom: 10 }}>
+                    <ModelChips names={eventTargets[fixedEvName.trim()] || []} onAdd={(n) => setFixedTargets(fixedEvName.trim(), (l) => addUniqueName(l, n))} onRemove={(n) => setFixedTargets(fixedEvName.trim(), (l) => l.filter((x) => x !== n))} placeholder={`「${fixedEvName.trim()}」の対象機種を追加`} />
+                  </div>
+                )}
+                {Object.keys(eventTargets).sort().map((E) => (
+                  <div key={E} style={{ ...S.row, marginBottom: 4, cursor: "pointer" }} onClick={() => setFixedEvName(E)}>
+                    <span><b>{E}</b>　<span style={{ color: "#e8b34c" }}>🎯 {eventTargets[E].join("、")}</span></span>
+                  </div>
+                ))}
               </div>
 
               <div style={S.card}>
@@ -1682,14 +1807,14 @@ export default function App() {
           )}
           {ovrGridDates.length > 0 && (
             <Collapse title="📋 機種×日付マトリクス（☆◎◯▲、直近30日）" defaultOpen>
-              <div style={S.note}>台数の多い順。青い枠はその日バラエティ（1台設置）だったセルです。</div>
+              <div style={S.note}>台数の多い順。青い枠はその日バラエティ（1台設置）だったセル、黄色い背景はイベント対象機種🎯です。</div>
               <div className="scrollbar" style={{ overflowX: "auto" }}>
                 <table style={{ borderCollapse: "collapse", fontSize: 11 }}>
                   <thead><tr><th style={{ ...S.th, position: "sticky", left: 0, background: "#1b212b" }} />{ovrGridDates.map((d) => <th key={d} className="mono" style={{ ...S.th, fontSize: 9 }}>{d.slice(5)}</th>)}</tr></thead>
                   <tbody>{ovrGridRows.map((k) => (
                     <tr key={k}>
                       <td title={displayNameOf[k] || k} style={{ ...S.td, position: "sticky", left: 0, background: "#1b212b", maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", color: "#c7cbd4" }}>{displayNameOf[k] || k}</td>
-                      {ovrGridDates.map((d) => { const c = ovrMark[k] && ovrMark[k][d]; return <td key={d} className="mono" style={{ ...S.td, textAlign: "center", color: c && c.mark ? markColor(c.mark) : "#2a323f", boxShadow: c && c.variety ? "inset 0 0 0 1px rgba(122,162,247,0.5)" : undefined }}>{c && c.mark ? c.mark : "・"}</td>; })}
+                      {ovrGridDates.map((d) => { const c = ovrMark[k] && ovrMark[k][d]; return <td key={d} className="mono" style={{ ...S.td, textAlign: "center", color: c && c.mark ? markColor(c.mark) : "#2a323f", boxShadow: c && c.variety ? "inset 0 0 0 1px rgba(122,162,247,0.5)" : undefined, background: isTargetOn(d, k) ? "rgba(232,179,76,0.13)" : undefined }}>{c && c.mark ? c.mark : "・"}</td>; })}
                     </tr>
                   ))}</tbody>
                 </table>
@@ -1796,6 +1921,7 @@ export default function App() {
                         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                           <span className="mono" style={{ width: 22, height: 22, lineHeight: "22px", textAlign: "center", borderRadius: "50%", fontWeight: 800, color: "#12161d", background: GRADE_COLORS[p.grade] }}>{p.grade}</span>
                           <span className="mono" style={{ fontWeight: 700, color: "#e8b34c" }}>{machineLabel(m)}</span>
+                          {p.targetEvents && p.targetEvents.length > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: "#12161d", background: "#e8b34c", borderRadius: 999, padding: "1px 8px" }}>🎯 {p.targetEvents.join("、")}の対象</span>}
                           <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: p.points >= 0 ? "#9ece6a" : "#e5697a" }}>{p.points >= 0 ? "+" : ""}{p.points.toFixed(1)}pt</span>
                           <span style={{ fontSize: 11, color: "#5a6272" }}>前日 <span style={{ color: SYMBOL_COLORS[p.lastSym], fontWeight: 700 }}>{p.lastSym}</span>{p.lastExp && <> ・期待度 <span style={{ color: fiveBandColor(Math.round(p.lastExp.score * 100)) }}>{Math.round(p.lastExp.score * 100)}</span></>}</span>
                         </div>
@@ -1829,7 +1955,7 @@ export default function App() {
                   </span>
                 </div>
                 <div style={S.note}>
-                  <span style={{ color: SYMBOL_COLORS["☆"] }}>☆</span>＝読み取り上位20%＋プラス　<span style={{ color: SYMBOL_COLORS["〇"] }}>〇</span>＝上位50%＋プラス　<span style={{ color: SYMBOL_COLORS["▽"] }}>▽</span>＝上位50%だがマイナス　<span style={{ color: SYMBOL_COLORS["□"] }}>□</span>＝中間　<span style={{ color: "#8b93a3" }}>×</span>＝推定低設定（下位20%）　－＝判定不可（回転数不足）。点線の下線は個別台の代用データ。
+                  <span style={{ color: SYMBOL_COLORS["☆"] }}>☆</span>＝読み取り上位20%＋プラス　<span style={{ color: SYMBOL_COLORS["〇"] }}>〇</span>＝上位50%＋プラス　<span style={{ color: SYMBOL_COLORS["▽"] }}>▽</span>＝上位50%だがマイナス　<span style={{ color: SYMBOL_COLORS["□"] }}>□</span>＝中間　<span style={{ color: "#8b93a3" }}>×</span>＝推定低設定（下位20%）　－＝判定不可（回転数不足）。点線の下線は個別台の代用データ。黄色い背景＝その日のイベント対象機種🎯。
                 </div>
                 {renderSymbolGrid()}
               </div>
