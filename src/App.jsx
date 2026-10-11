@@ -17,7 +17,11 @@ import { storage } from "./storage";
 //   ②日付×イベントごとの「その日の対象機種」（slot-date-event-targets-v1、3×3のように毎回違う機種用）
 //   予想日の対象機種は🎯で表示し、エンジンに「イベント対象機種」「対象機種があるイベントで対象外」の
 //   パターンを追加（効くかどうかは他のパターンと同じく実測で点数化、n<15は0pt）。
-export const APP_VERSION = "0.2.0";
+// v0.2.1: 機種の選び方をプルダウンに変更（台数の多い順・台数表示・表記ゆれは1つにまとめる）。
+//   イベント対象機種・ページの正式名称の両方で使用。新台用に手入力欄も残す。
+// v0.2.2: 全体データに「イベントを選んで過去を見る」を追加（プラザ2にあった機能の入れ忘れ）。
+//   日別の総差枚・マーク機種・🎯対象機種の結果、機種別／末尾別のイベント日成績。「イベント無し」も選べる。
+export const APP_VERSION = "0.2.2";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -791,22 +795,29 @@ function Collapse({ title, defaultOpen = false, children, right }) {
   );
 }
 
-// 機種名を1つずつ追加・削除するチップ入力（イベント対象機種用）
-function ModelChips({ names, onAdd, onRemove, placeholder }) {
+// 機種名を1つずつ追加・削除するチップ入力（イベント対象機種・ページの正式名称で使用）
+// options: [{ key, name, count }]（台数の多い順）。プルダウンで選ぶか、新台などは手入力で追加する。
+function ModelChips({ names, onAdd, onRemove, placeholder, options, resolve, icon = "🎯" }) {
   const [v, setV] = useState("");
   const add = () => { const t = v.trim(); if (!t) return; onAdd(t); setV(""); };
+  const chosen = new Set(names.map((n) => (resolve ? resolve(n) : n)));
+  const opts = (options || []).filter((o) => !chosen.has(o.key));
   return (
     <div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
         {names.map((n) => (
           <span key={n} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, background: "rgba(232,179,76,0.10)", border: "1px solid #3a3320", borderRadius: 999, padding: "2px 6px 2px 8px" }}>
-            🎯 {n}<button onClick={() => onRemove(n)} style={{ background: "none", border: "none", color: "#5a6272", cursor: "pointer", padding: 0, display: "flex" }}><X size={10} /></button>
+            {icon ? `${icon} ` : ""}{n}<button onClick={() => onRemove(n)} style={{ background: "none", border: "none", color: "#5a6272", cursor: "pointer", padding: 0, display: "flex" }}><X size={10} /></button>
           </span>
         ))}
-        {!names.length && <span style={{ fontSize: 11, color: "#5a6272" }}>対象機種なし</span>}
+        {!names.length && <span style={{ fontSize: 11, color: "#5a6272" }}>未登録</span>}
       </div>
+      <select value="" onChange={(e) => { if (e.target.value) onAdd(e.target.value); }} style={{ ...S.input, width: "100%", fontSize: 12, padding: "6px 8px", marginBottom: 6 }}>
+        <option value="">{opts.length ? `▼ 機種を選んで追加（台数の多い順・${opts.length}機種）` : "（民レポ・アナスロを貼ると機種が選べます）"}</option>
+        {opts.map((o) => <option key={o.key} value={o.name}>{o.name}{o.count ? `（${o.count}台）` : ""}</option>)}
+      </select>
       <div style={{ display: "flex", gap: 6 }}>
-        <input list="model-names" value={v} onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} placeholder={placeholder || "機種名を入力して追加"} style={{ ...S.input, flex: 1, fontSize: 12, padding: "5px 8px" }} />
+        <input value={v} onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} placeholder={placeholder || "一覧に無い機種は手入力"} style={{ ...S.input, flex: 1, fontSize: 12, padding: "5px 8px" }} />
         <button style={S.ghost} onClick={add}>追加</button>
       </div>
     </div>
@@ -975,6 +986,17 @@ export default function App() {
     ovrDates.forEach((d) => ovr[d].modelRows.forEach((r) => { m[resolve(r.name)] = r.name; }));
     return m;
   }, [allDays, ovrDates, ovr, resolve]);
+  // プルダウン用：機種（表記ゆれは1つ）・直近の台数の多い順
+  const modelOptions = useMemo(() => {
+    const count = {};
+    const latest = allDays.length ? allDays[allDays.length - 1] : null;
+    if (latest) latest.rows.forEach((r) => { const k = resolve(r.em); count[k] = (count[k] || 0) + 1; });
+    const lastOvr = ovrDates.length ? ovr[ovrDates[ovrDates.length - 1]] : null;
+    if (lastOvr) lastOvr.modelRows.forEach((r) => { const k = resolve(r.name); if (!count[k]) count[k] = r.total || 1; });
+    const keys = new Set(Object.keys(displayNameOf));
+    return [...keys].map((k) => ({ key: k, name: displayNameOf[k], count: count[k] || 0 }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "ja"));
+  }, [allDays, ovrDates, ovr, resolve, displayNameOf]);
   const knownModelNames = useMemo(() => {
     const set = new Set();
     allDays.forEach((d) => d.rows.forEach((r) => set.add(r.em)));
@@ -1250,7 +1272,6 @@ export default function App() {
   }
 
   // ---- ページ ----
-  const [officialInput, setOfficialInput] = useState("");
   async function addPage() {
     const id = `page-${Date.now()}`;
     const r = await commitKV(KEYS.pages, (prev) => [...prev, { id, name: "", officialName: "" }]);
@@ -1446,6 +1467,43 @@ export default function App() {
     return { date: d, total: n ? tot : null, avg: n ? tot / n : null, avgG: n ? g / n : null, n, marks };
   }), [ovrDates, ovr]);
   const ovrGridDates = useMemo(() => [...ovrDates].slice(-30).reverse(), [ovrDates]);
+  // ---- イベントを選んで過去を見る（v0.2.2）----
+  const [evHist, setEvHist] = useState("");
+  const allEventNames = useMemo(() => {
+    const set = new Set(kv[KEYS.eventNames]);
+    Object.values(dateEvent).forEach((c) => splitNames(c).forEach((n) => set.add(n)));
+    return [...set].sort((a, b) => a.localeCompare(b, "ja"));
+  }, [kv, dateEvent]);
+  const evHistory = useMemo(() => {
+    if (!evHist || viewMode !== "overall") return null;
+    const match = (d) => (evHist === NO_EVENT_LABEL ? !eventsOn(d).length : eventsOn(d).includes(evHist));
+    const dates = ovrDates.filter(match).reverse();
+    const totals = dailyTotals.filter((t) => match(t.date));
+    const stat = {};
+    dates.forEach((d) => ovr[d].modelRows.forEach((r) => {
+      const k = resolve(r.name);
+      const st = stat[k] || (stat[k] = { key: k, n: 0, sum: 0, sumN: 0, marks: 0, target: 0, targetMarks: 0 });
+      st.n += 1;
+      if (r.avgSada !== null) { st.sum += r.avgSada; st.sumN += 1; }
+      const mk = classifyMinRepoMark(r);
+      if (mk) st.marks += 1;
+      if (isTargetOn(d, k)) { st.target += 1; if (mk) st.targetMarks += 1; }
+    }));
+    const models = Object.values(stat).map((x) => ({ ...x, avg: x.sumN ? x.sum / x.sumN : null, markRate: x.marks / x.n }))
+      .sort((a, b) => b.markRate - a.markRate || (b.avg ?? -1e9) - (a.avg ?? -1e9));
+    const dig = {};
+    dates.forEach((d) => ovr[d].digitRows.forEach((r) => {
+      const x = dig[r.name] || (dig[r.name] = { name: r.name, sum: 0, n: 0, hidden: 0, wins: 0, total: 0 });
+      if (r.avgSada !== null) { x.sum += r.avgSada; x.n += 1; } else if (r.hiddenNegative) x.hidden += 1;
+      if (r.total) { x.wins += r.wins; x.total += r.total; }
+    }));
+    const avgTotal = totals.filter((t) => t.total !== null);
+    return {
+      dates, totals, models, digits: Object.values(dig),
+      avgTotal: avgTotal.length ? avgTotal.reduce((a, t) => a + t.total, 0) / avgTotal.length : null,
+      avgPer: avgTotal.length ? avgTotal.reduce((a, t) => a + t.avg, 0) / avgTotal.length : null,
+    };
+  }, [evHist, viewMode, ovrDates, ovr, dailyTotals, eventsOn, resolve, isTargetOn]);
   const ovrGridRows = useMemo(() => {
     const cnt = {};
     ovrDates.forEach((d) => ovr[d].modelRows.forEach((r) => { const k = resolve(r.name); cnt[k] = Math.max(cnt[k] || 0, r.total || 1); }));
@@ -1688,7 +1746,7 @@ export default function App() {
                     <button onClick={addEvent} style={S.btn("#7aa2f7")}>登録</button>
                   </div>
                   <div style={{ fontSize: 11, color: "#8b93a3", margin: "2px 0 4px" }}>この日の対象機種（任意・3×3のように毎回違う機種の時）</div>
-                  <ModelChips names={evTargets} onAdd={(n) => setEvTargets((l) => addUniqueName(l, n))} onRemove={(n) => setEvTargets((l) => l.filter((x) => x !== n))} />
+                  <ModelChips options={modelOptions} resolve={resolve} names={evTargets} onAdd={(n) => setEvTargets((l) => addUniqueName(l, n))} onRemove={(n) => setEvTargets((l) => l.filter((x) => x !== n))} />
                   {evName.trim() && (eventTargets[evName.trim()] || []).length > 0 && <div style={{ fontSize: 11, color: "#e8b34c", marginTop: 4 }}>「{evName.trim()}」のいつもの対象機種：{eventTargets[evName.trim()].join("、")}（自動で対象）</div>}
                   <Status s={evStatus} />
                   <div style={{ fontSize: 11, color: "#5a6272", margin: "10px 0 4px" }}>登録済み（イベント名を押すと、その日の対象機種を編集できます）</div>
@@ -1714,7 +1772,7 @@ export default function App() {
                         {editTarget && editTarget.date === d && splitNames(dateEvent[d]).includes(editTarget.name) && (
                           <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px dashed #2a323f" }}>
                             <div style={{ fontSize: 11, color: "#8b93a3", marginBottom: 4 }}>{d}「{editTarget.name}」のその日の対象機種</div>
-                            <ModelChips names={(dateEventTargets[d] || {})[editTarget.name] || []} onAdd={(n) => setDateTargets(d, editTarget.name, (l) => addUniqueName(l, n))} onRemove={(n) => setDateTargets(d, editTarget.name, (l) => l.filter((x) => x !== n))} />
+                            <ModelChips options={modelOptions} resolve={resolve} names={(dateEventTargets[d] || {})[editTarget.name] || []} onAdd={(n) => setDateTargets(d, editTarget.name, (l) => addUniqueName(l, n))} onRemove={(n) => setDateTargets(d, editTarget.name, (l) => l.filter((x) => x !== n))} />
                             {(eventTargets[editTarget.name] || []).length > 0 && <div style={{ fontSize: 11, color: "#e8b34c", marginTop: 4 }}>＋いつもの対象機種：{eventTargets[editTarget.name].join("、")}</div>}
                           </div>
                         )}
@@ -1747,7 +1805,7 @@ export default function App() {
                 <input list="event-names" value={fixedEvName} onChange={(e) => setFixedEvName(e.target.value)} placeholder="イベント名を入力（または選択）" style={{ ...S.input, width: "100%", marginBottom: 8 }} />
                 {fixedEvName.trim() && (
                   <div style={{ marginBottom: 10 }}>
-                    <ModelChips names={eventTargets[fixedEvName.trim()] || []} onAdd={(n) => setFixedTargets(fixedEvName.trim(), (l) => addUniqueName(l, n))} onRemove={(n) => setFixedTargets(fixedEvName.trim(), (l) => l.filter((x) => x !== n))} placeholder={`「${fixedEvName.trim()}」の対象機種を追加`} />
+                    <ModelChips options={modelOptions} resolve={resolve} names={eventTargets[fixedEvName.trim()] || []} onAdd={(n) => setFixedTargets(fixedEvName.trim(), (l) => addUniqueName(l, n))} onRemove={(n) => setFixedTargets(fixedEvName.trim(), (l) => l.filter((x) => x !== n))} />
                   </div>
                 )}
                 {Object.keys(eventTargets).sort().map((E) => (
@@ -1803,6 +1861,75 @@ export default function App() {
                   ))}</tbody>
                 </table>
               </div>
+            </div>
+          )}
+          {ovrDates.length > 0 && (
+            <div style={S.card}>
+              <div style={S.h}>📅 イベントを選んで過去を見る</div>
+              <div style={S.note}>イベントを選ぶと、そのイベントがあった過去の日の結果（民レポ）をまとめて表示します。「イベント無し」を選ぶと通常日の結果が見られます。黄色の🎯はその日の対象機種です。</div>
+              <select value={evHist} onChange={(e) => setEvHist(e.target.value)} style={{ ...S.input, width: "100%", marginBottom: 10 }}>
+                <option value="">イベントを選択...</option>
+                <option value={NO_EVENT_LABEL}>{NO_EVENT_LABEL}（通常日）</option>
+                {allEventNames.map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+              {evHistory && (evHistory.dates.length === 0 ? <div style={{ fontSize: 12, color: "#5a6272" }}>このイベントの日の民レポはまだありません。</div> : (
+                <>
+                  <div style={{ fontSize: 12, color: "#c7cbd4", marginBottom: 8 }}>
+                    {evHistory.dates.length}回　平均の総差枚 <span className="mono" style={{ color: (evHistory.avgTotal ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(evHistory.avgTotal)}</span>　1台平均 <span className="mono" style={{ color: (evHistory.avgPer ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(evHistory.avgPer)}</span>
+                  </div>
+                  <div className="scrollbar" style={{ maxHeight: 380, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+                    {evHistory.totals.map((t) => {
+                      const tgMap = targetsOn(t.date);
+                      const tgKeys = new Set([...tgMap.values()].flatMap((x) => [...x]));
+                      const tgRows = ovr[t.date].modelRows.filter((r) => tgKeys.has(resolve(r.name)));
+                      return (
+                        <div key={t.date} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: 6, padding: "7px 9px" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6, fontSize: 12 }}>
+                            <span className="mono">{t.date}（{WD[weekdayOf(t.date)]}）{eventsOn(t.date).length > 0 && <span style={{ color: "#5a6272", fontSize: 10 }}> {eventsOn(t.date).join("、")}</span>}</span>
+                            <span className="mono">総差枚 <b style={{ color: (t.total ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(t.total)}</b>　平均{fmtSigned(t.avg)}　G{fmt(t.avgG)}</span>
+                          </div>
+                          {tgRows.length > 0 && (
+                            <div style={{ fontSize: 11, marginTop: 4, color: "#e8b34c" }}>
+                              🎯 {tgRows.map((r) => { const mk = classifyMinRepoMark(r); return <span key={r.name} style={{ marginRight: 8 }}>{r.name} <span className="mono" style={{ color: r.hiddenNegative || (r.avgSada ?? 0) < 0 ? "#e5697a" : "#9ece6a" }}>{r.hiddenNegative ? "マイナス" : fmtSigned(r.avgSada)}</span>{mk && <span style={{ color: markColor(mk) }}> {mk}</span>}</span>; })}
+                            </div>
+                          )}
+                          {t.marks.length > 0 && (
+                            <div style={{ fontSize: 11, marginTop: 4 }}>{t.marks.map((m, i) => <span key={i} style={{ color: markColor(m.mark), marginRight: 8 }}>{m.mark}{m.name}</span>)}</div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <Collapse title={`この日の機種別成績（マークが付いた割合の高い順・${evHistory.models.length}機種）`}>
+                    <div className="scrollbar" style={{ maxHeight: 360, overflow: "auto" }}>
+                      <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
+                        <thead><tr><th style={S.th}>機種</th><th style={{ ...S.th, textAlign: "right" }}>回数</th><th style={{ ...S.th, textAlign: "right" }}>マーク率</th><th style={{ ...S.th, textAlign: "right" }}>平均差枚</th><th style={{ ...S.th, textAlign: "right" }}>🎯対象</th></tr></thead>
+                        <tbody>{evHistory.models.map((m) => (
+                          <tr key={m.key}>
+                            <td style={{ ...S.td, whiteSpace: "normal" }}>{displayNameOf[m.key] || m.key}</td>
+                            <td className="mono" style={{ ...S.td, textAlign: "right" }}>{m.n}</td>
+                            <td className="mono" style={{ ...S.td, textAlign: "right" }}>{Math.round(m.markRate * 100)}%</td>
+                            <td className="mono" style={{ ...S.td, textAlign: "right", color: (m.avg ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(m.avg)}</td>
+                            <td className="mono" style={{ ...S.td, textAlign: "right", color: "#e8b34c" }}>{m.target ? `${m.target}回（マーク${m.targetMarks}）` : "―"}</td>
+                          </tr>
+                        ))}</tbody>
+                      </table>
+                    </div>
+                  </Collapse>
+                  <Collapse title="この日の末尾別成績">
+                    <table style={{ borderCollapse: "collapse", fontSize: 12 }}>
+                      <thead><tr><th style={S.th}>末尾</th><th style={{ ...S.th, textAlign: "right" }}>平均差枚</th><th style={{ ...S.th, textAlign: "right" }}>勝率</th></tr></thead>
+                      <tbody>{evHistory.digits.map((x) => (
+                        <tr key={x.name}>
+                          <td style={S.td}>{x.name}</td>
+                          <td className="mono" style={{ ...S.td, textAlign: "right", color: x.n && x.sum / x.n >= 0 ? "#9ece6a" : "#e5697a" }}>{x.n ? fmtSigned(x.sum / x.n) : "―"}{x.hidden > 0 && <span style={{ color: "#5a6272", fontSize: 10 }}>（マイナス非表示{x.hidden}回）</span>}</td>
+                          <td className="mono" style={{ ...S.td, textAlign: "right" }}>{x.total ? `${Math.round((x.wins / x.total) * 100)}%` : "―"}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </Collapse>
+                </>
+              ))}
             </div>
           )}
           {ovrGridDates.length > 0 && (
@@ -1883,18 +2010,9 @@ export default function App() {
                 <button style={{ ...S.ghost, color: "#e5697a" }} onClick={() => window.confirm("このページを削除しますか？（データ自体は消えません）") && deletePage(currentPage.id)}><Trash2 size={11} /> ページ削除</button>
               </div>
               <div style={{ fontSize: 11, color: "#5a6272", marginBottom: 6 }}>正式名称（アナスロ・民レポの機種名。複数機種をまとめる時は1つずつ追加）</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
-                {splitNames(currentPage.officialName).map((n) => (
-                  <span key={n} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, background: "rgba(122,162,247,0.12)", border: "1px solid #2a323f", borderRadius: 999, padding: "3px 6px 3px 10px" }}>
-                    {n}<button onClick={() => updatePage(currentPage.id, { officialName: joinNames(splitNames(currentPage.officialName).filter((x) => x !== n)) })} style={{ background: "none", border: "none", color: "#5a6272", cursor: "pointer", padding: 0 }}><X size={12} /></button>
-                  </span>
-                ))}
-              </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <input list="model-names" value={officialInput} onChange={(e) => setOfficialInput(e.target.value)} placeholder="機種名を入力して追加" style={{ ...S.input, flex: 1 }}
-                  onKeyDown={(e) => { if (e.key === "Enter" && officialInput.trim()) { updatePage(currentPage.id, { officialName: joinNames([...splitNames(currentPage.officialName).filter((x) => !modelNamesMatch(x, officialInput, resolve)), officialInput.trim()]) }); setOfficialInput(""); } }} />
-                <button style={S.ghost} onClick={() => { if (!officialInput.trim()) return; updatePage(currentPage.id, { officialName: joinNames([...splitNames(currentPage.officialName).filter((x) => !modelNamesMatch(x, officialInput, resolve)), officialInput.trim()]) }); setOfficialInput(""); }}>追加</button>
-              </div>
+              <ModelChips icon="" options={modelOptions} resolve={resolve} names={splitNames(currentPage.officialName)}
+                onAdd={(n) => updatePage(currentPage.id, { officialName: joinNames([...splitNames(currentPage.officialName).filter((x) => !modelNamesMatch(x, n, resolve)), n.trim()]) })}
+                onRemove={(n) => updatePage(currentPage.id, { officialName: joinNames(splitNames(currentPage.officialName).filter((x) => x !== n)) })} />
             </div>
           )}
 
