@@ -32,7 +32,12 @@ import { storage } from "./storage";
 //   平均差枚で突き合わせ、1台あたりのずれが大きい日に警告。前後7日の民レポとも比べて、
 //   「このアナスロは○日の民レポとぴったり合う＝日付を間違えて貼った可能性」まで出す。
 //   実サンプルで確認：同じ日なら1台あたり約9枚のずれ、違う日だと約1,200枚。
-export const APP_VERSION = "0.3.2";
+// v0.3.3: 「台数が合わない」がいつからいつまでか分かるように、④に全期間の履歴を追加
+//   （機種ごとに、合わない期間・台数・アナスロ側の台番号の増減・原因のヒント）。あわせて照合を改善：
+//   民レポのバラエティ欄に載っている台番号は機種別の台数から外す（自動で台番号の対応も登録）、
+//   稼働なしの台（G数0・差枚0）を民レポが数えていない場合は一致とみなす、
+//   「民レポにだけある機種と合わせると台数が合う」組み合わせをヒント表示（例：GOLD＋ゴージャス）。
+export const APP_VERSION = "0.3.3";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -294,11 +299,21 @@ export function estimateGsuFromSadaAndShutsu(sada, shutsu) {
 // =============================================================================
 // 同じ日の民レポ×アナスロ照合：機種名の自動照合候補・バラエティの台番号一致・G数の種類判定
 // =============================================================================
+// v0.3.3: 台数が合わない原因をできるだけ自動で切り分ける。
+//  ・民レポのバラエティ欄に載っている台番号は、機種別の台数から外して数える
+//    （アナスロでは多台数の機種と同じ名前でも、民レポでは別機種の1台設置として載る台がある）
+//  ・稼働なし（G数0・差枚0）の台は民レポが数えないことがあるので、それで台数が合えば「一致」とみなす
+//  ・合わない時は、民レポにだけある機種で台数の差を埋められる組み合わせ（例：GOLD 18台＝GOLD 11台＋ゴージャス 7台）をヒントに出す
+export const isIdleRow = (r) => !(r.g > 0) && !r.s;
 export function reconcileSameDay(overall, anasloRows, resolve) {
-  const res = { matched: [], suggestions: [], varietyAliases: [], countMismatch: [], minrepoOnly: [], anasloOnly: [], gtypes: [] };
+  const res = { matched: [], suggestions: [], varietyAliases: [], varietyNoMaps: [], countMismatch: [], minrepoOnly: [], anasloOnly: [], gtypes: [] };
   if (!overall || !anasloRows || anasloRows.length === 0) return res;
-  const groups = new Map(); // key -> { names:Set, rows:[] }
+  const nameCount = new Map();
+  anasloRows.forEach((r) => { const k = resolve(r.em || r.m); nameCount.set(k, (nameCount.get(k) || 0) + 1); });
+  const varietyNos = new Set(overall.modelRows.filter((r) => r.isVariety).map((r) => r.no));
+  const groups = new Map();
   anasloRows.forEach((r) => {
+    if (varietyNos.has(r.no)) return; // バラエティ欄の台は機種別の台数に入れない
     const k = resolve(r.em || r.m);
     if (!groups.has(k)) groups.set(k, { key: k, name: r.em || r.m, rows: [] });
     groups.get(k).rows.push(r);
@@ -315,20 +330,29 @@ export function reconcileSameDay(overall, anasloRows, resolve) {
       const a = byNo.get(row.no);
       if (!a) { res.minrepoOnly.push(row); return; }
       const ak = resolve(a.em || a.m);
-      usedGroups.add(ak);
-      if (ak !== resolve(row.name)) res.varietyAliases.push({ anasloName: a.em || a.m, minrepoName: row.name, no: row.no });
-      if (row.avgGsu && a.g) res.gtypes.push({ name: row.name, ratio: a.g / row.avgGsu, date: null });
+      if (ak !== resolve(row.name)) {
+        // アナスロでその名前の台が1台だけなら機種名の別名、複数台あるなら台番号で振り分け
+        if ((nameCount.get(ak) || 0) <= 1) res.varietyAliases.push({ anasloName: a.em || a.m, minrepoName: row.name, no: row.no });
+        else res.varietyNoMaps.push({ no: row.no, model: row.name, anasloName: a.m });
+      }
+      if (row.avgGsu && a.g) res.gtypes.push({ name: row.name, ratio: a.g / row.avgGsu });
       return;
     }
     const k = resolve(row.name);
     const g = groups.get(k);
     if (!g) { unmatchedMinrepo.push(row); return; }
     usedGroups.add(k);
-    const aAvgS = avg(g.rows, (r) => r.s);
-    const aAvgG = avg(g.rows, (r) => r.g);
-    const item = { name: row.name, key: k, mCount: row.total, aCount: g.rows.length, mAvg: row.avgSada, aAvg: aAvgS, mGsu: row.avgGsu, aGsu: aAvgG };
+    let rows = g.rows;
+    let idleNos = [];
+    if (row.total !== g.rows.length) {
+      const active = g.rows.filter((r) => !isIdleRow(r));
+      if (active.length === row.total) { idleNos = g.rows.filter(isIdleRow).map((r) => r.no); rows = active; }
+    }
+    const aAvgS = avg(rows, (r) => r.s);
+    const aAvgG = avg(rows, (r) => r.g);
+    const item = { name: row.name, key: k, mCount: row.total, aCount: g.rows.length, mAvg: row.avgSada, aAvg: aAvgS, mGsu: row.avgGsu, aGsu: aAvgG, idleNos, nos: g.rows.map((r) => r.no).sort((x, y) => x - y), idle: g.rows.filter(isIdleRow).map((r) => r.no) };
     res.matched.push(item);
-    if (row.total !== g.rows.length) res.countMismatch.push(item);
+    if (row.total !== rows.length) res.countMismatch.push(item);
     else if (row.avgGsu && aAvgG) res.gtypes.push({ name: row.name, ratio: aAvgG / row.avgGsu });
   });
   const freeGroups = [...groups.values()].filter((g) => !usedGroups.has(g.key));
@@ -343,6 +367,12 @@ export function reconcileSameDay(overall, anasloRows, resolve) {
       const g = cands[0];
       res.suggestions.push({ minrepoName: row.name, anasloName: g.name, count: row.total, mAvg: row.avgSada, aAvg: avg(g.rows, (r) => r.s) });
     } else res.minrepoOnly.push(row);
+  });
+  // ヒント：民レポにだけある機種の台数で差が埋まるか（アナスロが2機種を1つの名前でまとめている）
+  res.countMismatch.forEach((it) => {
+    const extra = it.aCount - it.mCount;
+    const combo = res.minrepoOnly.find((r) => !r.isVariety && r.total === extra);
+    if (combo) it.comboWith = { name: combo.name, count: combo.total };
   });
   const suggested = new Set(res.suggestions.map((s) => resolve(s.anasloName)));
   res.anasloOnly = freeGroups.filter((g) => !suggested.has(g.key)).map((g) => ({ name: g.name, count: g.rows.length }));
@@ -381,8 +411,9 @@ export function eventTargetsOn(date, eventNames, eventTargets, dateEventTargets,
 export const DRIFT_OK = 60;
 export const DRIFT_BAD = 250;
 export function compareMinrepoAnaslo(overall, anasloRows, resolve) {
+  const varietyNos = new Set(overall.modelRows.filter((r) => r.isVariety).map((r) => r.no));
   const groups = new Map();
-  anasloRows.forEach((r) => { const k = resolve(r.em || r.m); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); });
+  anasloRows.forEach((r) => { if (varietyNos.has(r.no)) return; const k = resolve(r.em || r.m); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); });
   const byNo = new Map(anasloRows.map((r) => [r.no, r]));
   let mTotal = 0, mCount = 0, hidden = 0, errSum = 0, w = 0;
   const aTotal = anasloRows.reduce((a, r) => a + (r.s || 0), 0);
@@ -396,8 +427,9 @@ export function compareMinrepoAnaslo(overall, anasloRows, resolve) {
       if (a && a.s !== null) { errSum += Math.abs(a.s - r.avgSada); w += 1; }
       return;
     }
-    const rows = groups.get(resolve(r.name));
-    if (!rows || rows.length !== r.total) return;
+    let rows = groups.get(resolve(r.name));
+    if (rows && rows.length !== r.total) { const act = rows.filter((x) => !isIdleRow(x)); rows = act.length === r.total ? act : null; }
+    if (!rows) return;
     const vals = rows.map((x) => x.s).filter((v) => v !== null);
     if (vals.length !== rows.length) return;
     errSum += Math.abs(vals.reduce((a, b) => a + b, 0) / vals.length - r.avgSada) * r.total;
@@ -1121,8 +1153,16 @@ export default function App() {
     const newAliases = {};
     rec.varietyAliases.forEach((v) => { newAliases[normalizeModelName(v.anasloName)] = v.minrepoName; });
     if (Object.keys(newAliases).length) await commitKV(KEYS.aliases, (prev) => ({ ...prev, ...newAliases }));
+    // アナスロでは多台数の機種と同じ名前なのに、民レポではバラエティ（別機種の1台）として載っている台 → 台番号で振り分け
+    const newNoMaps = {};
+    rec.varietyNoMaps.forEach((v) => {
+      const cur = kvRef.current[KEYS.noModel][v.no];
+      if (!cur || normalizeModelName(cur.model) !== normalizeModelName(v.model)) newNoMaps[v.no] = { model: v.model, anasloName: v.anasloName, since: date };
+    });
+    if (Object.keys(newNoMaps).length) await commitKV(KEYS.noModel, (prev) => ({ ...prev, ...newNoMaps }));
     const res1 = makeResolver(kvRef.current[KEYS.aliases]);
-    const rec2 = Object.keys(newAliases).length ? reconcileSameDay(o, rows, res1) : rec;
+    const rows1 = Object.keys(newNoMaps).length ? unpackDay(r).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, kvRef.current[KEYS.noModel]) })) : rows;
+    const rec2 = Object.keys(newAliases).length || Object.keys(newNoMaps).length ? reconcileSameDay(o, rows1, res1) : rec;
     const updates = {};
     rec2.gtypes.forEach((g) => {
       const t = gtypeFromRatio(g.ratio);
@@ -1145,7 +1185,7 @@ export default function App() {
         return next;
       });
     }
-    return { ...rec2, varietyAliases: rec.varietyAliases }; // 今回自動で照合したバラエティ台を報告する
+    return { ...rec2, varietyAliases: rec.varietyAliases, varietyNoMaps: rec.varietyNoMaps }; // 今回自動で照合したバラエティ台を報告する
   }, [commitKV]);
 
   // =========================================================================
@@ -1291,6 +1331,7 @@ export default function App() {
   function reconcileSummary(rec) {
     const parts = [];
     if (rec.varietyAliases.length) parts.push(`バラエティ台の名前違い${rec.varietyAliases.length}件を台番号で自動照合しました。`);
+    if (rec.varietyNoMaps && rec.varietyNoMaps.length) parts.push(`民レポでバラエティ（別機種の1台）として載っている台番号${rec.varietyNoMaps.map((v) => v.no).join("・")}を、台番号で振り分けるように登録しました。`);
     if (rec.suggestions.length) parts.push(`名前が違う機種の候補が${rec.suggestions.length}件あります →「機種名の照合」で確認してください。`);
     if (rec.countMismatch.length) parts.push(`台数が合わない機種：${rec.countMismatch.map((x) => `${x.name}（民レポ${x.mCount}/アナスロ${x.aCount}）`).join("、")}`);
     return parts.length ? `\n${parts.join("\n")}` : "\n民レポとアナスロの機種はすべて一致しました。";
@@ -1519,6 +1560,41 @@ export default function App() {
     });
     return out;
   }, [viewMode, unlocked, bothDates, anasloRowsOf, ovr, ovrDates, resolve]);
+  // ---- 台数が合わない日の履歴（全期間・v0.3.3）----
+  const countHistory = useMemo(() => {
+    if (viewMode !== "common" || !unlocked) return null;
+    const byKey = new Map();
+    let prevNos = new Map();
+    bothDates.forEach((d) => {
+      const rec = reconcileSameDay(ovr[d], anasloRowsOf(d), resolve);
+      const mis = new Map(rec.countMismatch.map((x) => [x.key, x]));
+      const curNos = new Map(rec.matched.map((x) => [x.key, x.nos]));
+      mis.forEach((x, k) => {
+        if (!byKey.has(k)) byKey.set(k, { key: k, name: x.name, days: [], comboWith: null });
+        const h = byKey.get(k);
+        const before = prevNos.get(k);
+        const added = before ? x.nos.filter((n) => !before.includes(n)) : [];
+        const removed = before ? before.filter((n) => !x.nos.includes(n)) : [];
+        h.days.push({ date: d, mCount: x.mCount, aCount: x.aCount, added, removed, nos: x.nos });
+        if (x.comboWith) h.comboWith = x.comboWith;
+      });
+      // 一致した日も「区切り」として記録（期間をまたいでくっつけないため）
+      byKey.forEach((h, k) => { if (!mis.has(k) && curNos.has(k)) h.days.push({ date: d, ok: true }); });
+      prevNos = curNos;
+    });
+    // 同じ台数の連続した日を1つの期間にまとめる
+    return [...byKey.values()].map((h) => {
+      const runs = [];
+      h.days.forEach((x) => {
+        const last = runs[runs.length - 1];
+        if (last && !x.ok && !last.ok && last.mCount === x.mCount && last.aCount === x.aCount && !x.added.length && !x.removed.length) { last.to = x.date; last.n += 1; return; }
+        if (last && x.ok && last.ok) { last.to = x.date; last.n += 1; return; }
+        runs.push({ ...x, from: x.date, to: x.date, n: 1 });
+      });
+      const bad = h.days.filter((x) => !x.ok);
+      return { ...h, runs, badDays: bad.length, first: bad[0].date, last: bad[bad.length - 1].date };
+    }).sort((a, b) => b.last.localeCompare(a.last) || b.badDays - a.badDays);
+  }, [viewMode, unlocked, bothDates, ovr, anasloRowsOf, resolve]);
   const driftProblems = useMemo(() => (driftChecks ? Object.entries(driftChecks).filter(([, c]) => c.level === "warn" || c.level === "bad").sort((a, b) => b[0].localeCompare(a[0])) : []), [driftChecks]);
   const onlyOneSide = useMemo(() => {
     const all = new Set([...ovrDates, ...rawDates]);
@@ -2077,7 +2153,11 @@ export default function App() {
                           </div>
                         ))}
                         {recResult.countMismatch.map((x) => (
-                          <div key={x.key} style={{ ...S.row, color: "#e8b34c" }}>台数が違う：「{x.name}」民レポ{x.mCount}台 / アナスロ{x.aCount}台 → 別機種が同じ名前でまとめて表示されている可能性があります。混ざっている機種の個別台データ（③）を一度貼ってください。</div>
+                          <div key={x.key} style={{ ...S.row, color: "#e8b34c", display: "block" }}>
+                            台数が違う：「{x.name}」民レポ{x.mCount}台 / アナスロ{x.aCount}台
+                            {x.comboWith ? <div style={{ color: "#9ece6a", marginTop: 2 }}>→ 民レポの「{x.comboWith.name}」（{x.comboWith.count}台）と合わせると一致します。アナスロが2機種を1つの名前でまとめています。「{x.comboWith.name}」の個別台データ（③）を一度貼ると台番号で分けられます。</div>
+                              : <div style={{ color: "#8b93a3", marginTop: 2 }}>→ アナスロの台番号：<span className="mono">{x.nos.join(", ")}</span>{x.idle.length > 0 && `（稼働なし：${x.idle.join(", ")}）`}。下の履歴で、いつから合わなくなったか（台番号の増減）を確認できます。</div>}
+                          </div>
                         ))}
                         {recResult.minrepoOnly.length > 0 && <div style={{ color: "#e5697a" }}>アナスロに見つからない：{recResult.minrepoOnly.map((r) => r.name + (r.no ? `(${r.no})` : "")).join("、")}</div>}
                         {recResult.anasloOnly.length > 0 && <div style={{ color: "#e5697a" }}>民レポに見つからない：{recResult.anasloOnly.map((g) => `${g.name}(${g.count}台)`).join("、")}</div>}
@@ -2085,6 +2165,32 @@ export default function App() {
                     )}
                   </>
                 )}
+                {countHistory && countHistory.length > 0 && (
+                  <Collapse title={`📅 台数が合わない日の履歴（全期間・${countHistory.length}機種）`} defaultOpen>
+                    <div style={S.note}>機種ごとに、民レポとアナスロで台数が合わなかった期間をまとめています。期間の切れ目で台番号が増えた・減った時は「＋／−」で表示します（新台入れ替えや台移動のタイミングの目安）。</div>
+                    <div className="scrollbar" style={{ maxHeight: 460, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+                      {countHistory.map((h) => (
+                        <div key={h.key} style={{ background: "#12161d", border: "1px solid #3a3320", borderRadius: 6, padding: "8px 10px", fontSize: 12 }}>
+                          <div style={{ fontWeight: 700, color: "#e8b34c" }}>{h.name}</div>
+                          <div className="mono" style={{ color: "#8b93a3", fontSize: 11, marginTop: 2 }}>合わない日：{h.badDays}日（最初 {md(h.first)}・最後 {md(h.last)}）</div>
+                          {h.comboWith && <div style={{ color: "#9ece6a", fontSize: 11, marginTop: 2 }}>→ 民レポの「{h.comboWith.name}」（{h.comboWith.count}台）と合わせると一致。その個別台データ（③）を一度貼ると解決します。</div>}
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 3 }}>
+                            {h.runs.map((r, i) => (
+                              <div key={i} className="mono" style={{ fontSize: 11, color: r.ok ? "#5a6272" : "#c7cbd4", lineHeight: 1.5 }}>
+                                {md(r.from)}{r.to !== r.from ? `〜${md(r.to)}` : ""}（{r.n}日）
+                                {r.ok ? "　一致" : <>　民レポ{r.mCount}台／アナスロ<b style={{ color: "#e8b34c" }}>{r.aCount}台</b></>}
+                                {!r.ok && (r.added.length > 0 || r.removed.length > 0) && (
+                                  <span style={{ color: "#7aa2f7" }}>　台番号{r.added.length > 0 ? ` ＋${r.added.join(",")}` : ""}{r.removed.length > 0 ? ` −${r.removed.join(",")}` : ""}</span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </Collapse>
+                )}
+                {countHistory && countHistory.length === 0 && bothDates.length > 0 && <div style={{ fontSize: 12, color: "#9ece6a", margin: "6px 0" }}>全期間で、民レポとアナスロの台数はすべて合っています。</div>}
                 <Collapse title={`登録済みの別名（${Object.keys(aliases).length}）・台番号の対応（${Object.keys(noModel).length}）・G数の種類（${Object.keys(gtypes).length}）`}>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11.5 }}>
                     {Object.entries(aliases).map(([k, v]) => (
