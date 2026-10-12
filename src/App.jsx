@@ -27,7 +27,12 @@ import { storage } from "./storage";
 //   店休日の目印）／表示する台番（全選択・全解除・過去の台番）／日別データ＋この日までの差枚推移
 //   （7/10/20/30日間）＋この日までの期待度表／台別チャート／〇のつく日／ピックアップ／台同士の相関／
 //   総差枚しきい値分析。スマホ表示も全体で見直し（全体データの推移表が潰れていた不具合を修正）。
-export const APP_VERSION = "0.3.0";
+// v0.3.1: マトリクス表の日付の下に「その日の☆〇の数／判定できた台数」を表示（出る日・出ない日の目安）。
+// v0.3.2: 民レポとアナスロのずれチェックを追加。同じ日の両方を、機種ごと（バラエティは台番号ごと）の
+//   平均差枚で突き合わせ、1台あたりのずれが大きい日に警告。前後7日の民レポとも比べて、
+//   「このアナスロは○日の民レポとぴったり合う＝日付を間違えて貼った可能性」まで出す。
+//   実サンプルで確認：同じ日なら1台あたり約9枚のずれ、違う日だと約1,200枚。
+export const APP_VERSION = "0.3.2";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -368,6 +373,43 @@ export function eventTargetsOn(date, eventNames, eventTargets, dateEventTargets,
     if (names.length) out.set(E, new Set(names.map(resolve)));
   });
   return out;
+}
+
+// 民レポとアナスロのずれ（v0.3.2）。機種ごとの平均差枚（台数が一致する機種だけ）と、
+// バラエティ台の台番号ごとの差枚で突き合わせ、1台あたりの平均のずれ（err）を出す。
+// 同じ日のデータなら err は数十枚以内（実サンプルで約9枚）、違う日なら数百〜千枚以上になる。
+export const DRIFT_OK = 60;
+export const DRIFT_BAD = 250;
+export function compareMinrepoAnaslo(overall, anasloRows, resolve) {
+  const groups = new Map();
+  anasloRows.forEach((r) => { const k = resolve(r.em || r.m); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); });
+  const byNo = new Map(anasloRows.map((r) => [r.no, r]));
+  let mTotal = 0, mCount = 0, hidden = 0, errSum = 0, w = 0;
+  const aTotal = anasloRows.reduce((a, r) => a + (r.s || 0), 0);
+  overall.modelRows.forEach((r) => {
+    const n = r.isVariety ? 1 : r.total || 0;
+    mCount += n;
+    if (r.avgSada === null) { hidden += n; return; }
+    mTotal += r.avgSada * n;
+    if (r.isVariety) {
+      const a = byNo.get(r.no);
+      if (a && a.s !== null) { errSum += Math.abs(a.s - r.avgSada); w += 1; }
+      return;
+    }
+    const rows = groups.get(resolve(r.name));
+    if (!rows || rows.length !== r.total) return;
+    const vals = rows.map((x) => x.s).filter((v) => v !== null);
+    if (vals.length !== rows.length) return;
+    errSum += Math.abs(vals.reduce((a, b) => a + b, 0) / vals.length - r.avgSada) * r.total;
+    w += r.total;
+  });
+  return { mTotal, aTotal, diff: aTotal - mTotal, mCount, aCount: anasloRows.length, hidden, err: w ? errSum / w : null, matched: w };
+}
+export function driftLevel(c) {
+  if (!c || c.err === null || c.matched < 20) return "unknown";
+  if (c.err <= DRIFT_OK) return "ok";
+  if (c.err <= DRIFT_BAD) return "warn";
+  return "bad";
 }
 
 // =============================================================================
@@ -1150,7 +1192,8 @@ export default function App() {
     let msg = `${ovrDate} の民レポを保存しました（機種${parsed.modelRows.length - v}・バラエティ${v}・末尾${parsed.digitRows.length}）。`;
     const rec = await autoReconcile(ovrDate);
     if (rec) msg += reconcileSummary(rec);
-    setOvrStatus({ type: "ok", msg });
+    const dw = driftWarning(ovrDate);
+    setOvrStatus({ type: dw ? "warn" : "ok", msg: msg + (dw || "") });
     setOvrText("");
   }
 
@@ -1178,7 +1221,8 @@ export default function App() {
     let msg = `${anaDate} のアナスロを保存しました（${rows.length}台${replaced ? `・個別台の代用${replaced}台を上書き` : ""}）。`;
     const rec = await autoReconcile(anaDate);
     if (rec) msg += reconcileSummary(rec);
-    setAnaStatus({ type: "ok", msg });
+    const dw = driftWarning(anaDate);
+    setAnaStatus({ type: dw ? "warn" : "ok", msg: msg + (dw || "") });
     setAnaText("");
     setAnaDate(addDays(anaDate, -1));
   }
@@ -1222,6 +1266,26 @@ export default function App() {
     if (Object.keys(learnedMap).length) msg += `\n台番号${Object.keys(learnedMap).join("・")}を「${model}」として覚えました（アナスロでは「${Object.values(learnedMap)[0].anasloName}」と表示されている台）。`;
     setKbStatus({ type: "ok", msg });
     setKbText("");
+  }
+
+  // 保存した直後に、同じ日の民レポ／アナスロとずれていないかを確認する（ref から最新を読む）
+  function driftWarning(date) {
+    const o = ovrRef.current[date];
+    const r = rawRef.current[date];
+    if (!o || !r) return null;
+    const res0 = makeResolver(kvRef.current[KEYS.aliases]);
+    const rows = unpackDay(r).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, kvRef.current[KEYS.noModel]) }));
+    if (!rows.length) return null;
+    const c = compareMinrepoAnaslo(o, rows, res0);
+    const level = driftLevel(c);
+    if (level === "ok" || level === "unknown") return null;
+    let better = null;
+    Object.keys(ovrRef.current).forEach((od) => {
+      if (od === date || od < addDays(date, -7) || od > addDays(date, 7)) return;
+      const c2 = compareMinrepoAnaslo(ovrRef.current[od], rows, res0);
+      if (c2.err !== null && c2.matched >= 20 && c2.err <= DRIFT_OK && (!better || c2.err < better.err)) better = { date: od, err: c2.err };
+    });
+    return `\n⚠ ${date} の民レポとアナスロがずれています（1台あたり平均${Math.round(c.err).toLocaleString()}枚・総差枚 民レポ${fmtSigned(c.mTotal)}／アナスロ${fmtSigned(c.aTotal)}）。どちらかの日付を間違えていないか確認してください。${better ? `\n→ このアナスロは ${better.date} の民レポとぴったり合います。` : ""}`;
   }
 
   function reconcileSummary(rec) {
@@ -1432,6 +1496,34 @@ export default function App() {
 
   // ---- 機種名の照合（画面表示用）----
   const bothDates = useMemo(() => ovrDates.filter((d) => raw[d]), [ovrDates, raw]);
+  // ---- 民レポとアナスロのずれチェック（v0.3.2）----
+  const anasloRowsOf = useCallback((d) => (raw[d] ? unpackDay(raw[d]).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, noModel) })) : []), [raw, noModel]);
+  const driftChecks = useMemo(() => {
+    if (viewMode !== "common" || !unlocked) return null;
+    const out = {};
+    bothDates.forEach((d) => {
+      const rows = anasloRowsOf(d);
+      if (!rows.length) return;
+      const c = compareMinrepoAnaslo(ovr[d], rows, resolve);
+      const level = driftLevel(c);
+      let better = null;
+      if (level === "warn" || level === "bad") {
+        // 前後7日の民レポのうち、このアナスロとぴったり合う日を探す
+        ovrDates.forEach((od) => {
+          if (od === d || od < addDays(d, -7) || od > addDays(d, 7)) return;
+          const c2 = compareMinrepoAnaslo(ovr[od], rows, resolve);
+          if (c2.err !== null && c2.matched >= 20 && c2.err <= DRIFT_OK && (!better || c2.err < better.err)) better = { date: od, err: c2.err };
+        });
+      }
+      out[d] = { ...c, level, better };
+    });
+    return out;
+  }, [viewMode, unlocked, bothDates, anasloRowsOf, ovr, ovrDates, resolve]);
+  const driftProblems = useMemo(() => (driftChecks ? Object.entries(driftChecks).filter(([, c]) => c.level === "warn" || c.level === "bad").sort((a, b) => b[0].localeCompare(a[0])) : []), [driftChecks]);
+  const onlyOneSide = useMemo(() => {
+    const all = new Set([...ovrDates, ...rawDates]);
+    return [...all].filter((d) => !(ovr[d] && raw[d] && unpackDay(raw[d]).some((x) => x.src !== "m"))).sort().reverse();
+  }, [ovrDates, rawDates, ovr, raw]);
   const [recDate, setRecDate] = useState("");
   const recDateEff = recDate && bothDates.includes(recDate) ? recDate : bothDates[bothDates.length - 1] || "";
   const recResult = useMemo(() => {
@@ -1507,6 +1599,17 @@ export default function App() {
   }, [engine]);
   const recOf = useCallback((key, date) => { const mm = recIndex.get(key); return mm ? mm.get(date) || null : null; }, [recIndex]);
   const recAt = useCallback((m, date) => recOf(m.key, date), [recOf]);
+  // 日付ごとの☆〇の数（判定不可の－は数えない）
+  const goodCountByDate = useMemo(() => {
+    const out = {};
+    if (engine) engine.ctx.machines.forEach((m) => m.recs.forEach((r) => {
+      if (r.sym === "－") return;
+      const c = out[r.date] || (out[r.date] = { good: 0, n: 0 });
+      c.n += 1;
+      if (GOOD_SYMBOLS.has(r.sym)) c.good += 1;
+    }));
+    return out;
+  }, [engine]);
   const sortMachines = (arr) => arr.sort((a, b) => a.no - b.no || a.model.localeCompare(b.model));
   const activeMachines = useMemo(() => (engine ? sortMachines([...engine.ctx.machines.values()].filter((m) => m.recs.length && m.recs[m.recs.length - 1].di === lastPageDi)) : EMPTY), [engine, lastPageDi]);
   const allMachines = useMemo(() => (engine ? sortMachines([...engine.ctx.machines.values()]) : EMPTY), [engine]);
@@ -1766,9 +1869,16 @@ export default function App() {
       })}
     </div>
   );
-  const gridHeadCell = (d) => (
-    <th key={d} className="mono" style={{ background: "#12161d", padding: "4px 3px", borderBottom: "1px solid #2a323f", fontSize: 9, whiteSpace: "nowrap", color: isStrong(d) ? "#e5484d" : isSemi(d) ? "#9ece6a" : eventsOn(d).length ? "#f2d24b" : "#5a6272" }}>{d.slice(5)}</th>
-  );
+  const gridHeadCell = (d) => {
+    const c = goodCountByDate[d];
+    const rate = c && c.n ? c.good / c.n : null;
+    return (
+      <th key={d} className="mono" title={c ? `☆〇 ${c.good}台／判定できた台 ${c.n}台` : ""} style={{ background: "#12161d", padding: "4px 3px", borderBottom: "1px solid #2a323f", fontSize: 9, whiteSpace: "nowrap", fontWeight: 600, color: isStrong(d) ? "#e5484d" : isSemi(d) ? "#9ece6a" : eventsOn(d).length ? "#f2d24b" : "#5a6272" }}>
+        {d.slice(5)}
+        {c && <div style={{ fontSize: 8, fontWeight: 400, marginTop: 1, color: rate >= 0.5 ? "#e5697a" : rate >= 0.3 ? "#f2d24b" : "#5a6272" }}>☆〇{c.good}/{c.n}</div>}
+      </th>
+    );
+  };
   const rowHeadStyle = { position: "sticky", left: 0, zIndex: 1, background: "#12161d", color: "#c7cbd4", padding: "4px 8px", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 112, boxSizing: "border-box" };
   const renderSymbolGrid = (dates, list) => (!list.length || !dates.length ? <div style={{ fontSize: 12, color: "#5a6272" }}>表示できるデータがまだありません。</div> : (
     <div className="scrollbar" style={{ overflowX: "auto", maxWidth: "100%", WebkitOverflowScrolling: "touch", overscrollBehaviorX: "contain" }}>
@@ -1990,6 +2100,35 @@ export default function App() {
                 </Collapse>
               </div>
 
+              <div style={{ ...S.card, borderColor: driftProblems.some(([, c]) => c.level === "bad") ? "#7a3038" : "#2a323f" }}>
+                <div style={S.h}>⑤ 民レポとアナスロのずれチェック</div>
+                <div style={S.note}>同じ日の民レポとアナスロを、機種ごと（バラエティは台番号ごと）の平均差枚で突き合わせます。同じ日のデータなら1台あたりのずれは数十枚以内です。ずれが大きい日は、どちらかの日付を間違えて貼った可能性があります。前後7日の民レポとも比べて、ぴったり合う日があれば表示します。</div>
+                {!driftChecks || !bothDates.length ? <div style={{ fontSize: 12, color: "#5a6272" }}>民レポとアナスロが両方そろった日がまだありません。</div> : (
+                  <>
+                    <div style={{ fontSize: 12, marginBottom: 8, color: driftProblems.length ? "#e8b34c" : "#9ece6a" }}>
+                      {Object.keys(driftChecks).length}日分チェック：{driftProblems.length ? `ずれている日が${driftProblems.length}日あります` : "すべて一致しています"}
+                      {onlyOneSide.length > 0 && <span style={{ color: "#8b93a3" }}>　（片方しか入っていない日：{onlyOneSide.length}日）</span>}
+                    </div>
+                    <div className="scrollbar" style={{ maxHeight: 320, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+                      {driftProblems.map(([d, c]) => (
+                        <div key={d} style={{ background: "#12161d", border: `1px solid ${c.level === "bad" ? "#7a3038" : "#5a4a20"}`, borderRadius: 6, padding: "8px 10px", fontSize: 12 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                            <span><span style={{ color: c.level === "bad" ? "#e5697a" : "#e8b34c", fontWeight: 700 }}>{c.level === "bad" ? "⚠ 大きくずれ" : "△ 少しずれ"}</span>　<span className="mono">{d}（{WD[weekdayOf(d)]}）</span></span>
+                            <button style={S.ghost} onClick={() => { loadOvrDate(d); loadAnaDate(d); window.scrollTo({ top: 0, behavior: "smooth" }); }}>入力欄に読み込む</button>
+                          </div>
+                          <div className="mono" style={{ color: "#8b93a3", marginTop: 4, lineHeight: 1.6 }}>
+                            1台あたり平均 <b style={{ color: c.level === "bad" ? "#e5697a" : "#e8b34c" }}>{Math.round(c.err).toLocaleString()}枚</b> のずれ<br />
+                            総差枚 民レポ {fmtSigned(c.mTotal)}{c.hidden > 0 ? "（マイナス非表示あり）" : ""} ／ アナスロ {fmtSigned(c.aTotal)}（差 {fmtSigned(c.diff)}）<br />
+                            台数 民レポ {c.mCount}台 ／ アナスロ {c.aCount}台
+                          </div>
+                          {c.better && <div style={{ marginTop: 4, color: "#9ece6a" }}>→ このアナスロは <b className="mono">{c.better.date}</b> の民レポとぴったり合います（1台あたり{Math.round(c.better.err)}枚）。アナスロの日付を間違えて貼った可能性が高いです。</div>}
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+
               <Collapse title={`登録済みの日付（${new Set([...ovrDates, ...rawDates]).size}日）`} defaultOpen>
                 <div className="scrollbar" style={{ maxHeight: 260, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5 }}>
                   {Array.from(new Set([...ovrDates, ...rawDates])).sort().reverse().map((d) => {
@@ -2003,6 +2142,7 @@ export default function App() {
                           <span style={{ marginLeft: 6, color: ovr[d] ? "#9ece6a" : "#e5697a" }}>民レポ{ovr[d] ? "〇" : "未"}</span>
                           <span style={{ marginLeft: 6, color: rows.length - man ? "#9ece6a" : "#e5697a" }}>アナスロ{rows.length - man ? "〇" : "未"}</span>
                           {man > 0 && <span style={{ marginLeft: 6, color: "#bb9af7" }}>代用{man}台</span>}
+                          {driftChecks && driftChecks[d] && (driftChecks[d].level === "bad" || driftChecks[d].level === "warn") && <span style={{ marginLeft: 6, color: driftChecks[d].level === "bad" ? "#e5697a" : "#e8b34c", fontWeight: 700 }}>⚠ずれ</span>}
                         </span>
                         <span style={{ display: "flex", gap: 6, flexShrink: 0 }}>
                           {ovr[d] && <button style={S.ghost} onClick={() => deleteDate("ovr", d)}>民レポ削除</button>}
@@ -2354,7 +2494,7 @@ export default function App() {
                   <div style={S.h}>📋 台番号×日付マトリクス表</div>
                   <div style={S.note}>台番号ごとに、日付ごとの記号を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。</div>
                   {renderEventMultiSelect()}
-                  <div style={{ ...S.note, marginBottom: 8 }}><span style={{ color: SYMBOL_COLORS["☆"] }}>☆</span>＝読み取り上位20%＋プラス　<span style={{ color: SYMBOL_COLORS["〇"] }}>〇</span>＝上位50%＋プラス　<span style={{ color: SYMBOL_COLORS["▽"] }}>▽</span>＝上位50%だがマイナス　<span style={{ color: SYMBOL_COLORS["□"] }}>□</span>＝中間　<span style={{ color: "#8b93a3" }}>×</span>＝推定低設定（下位20%）　－＝判定不可（回転数不足）。点線の下線は個別台の代用データ。黄色い背景＝その日のイベント対象機種🎯。日付の色：赤＝強いイベント・緑＝準イベント・黄＝イベント。</div>
+                  <div style={{ ...S.note, marginBottom: 8 }}><span style={{ color: SYMBOL_COLORS["☆"] }}>☆</span>＝読み取り上位20%＋プラス　<span style={{ color: SYMBOL_COLORS["〇"] }}>〇</span>＝上位50%＋プラス　<span style={{ color: SYMBOL_COLORS["▽"] }}>▽</span>＝上位50%だがマイナス　<span style={{ color: SYMBOL_COLORS["□"] }}>□</span>＝中間　<span style={{ color: "#8b93a3" }}>×</span>＝推定低設定（下位20%）　－＝判定不可（回転数不足）。点線の下線は個別台の代用データ。黄色い背景＝その日のイベント対象機種🎯。日付の色：赤＝強いイベント・緑＝準イベント・黄＝イベント。日付の下の「☆〇4/12」＝その日☆〇だった台数／判定できた台数（出る日・出ない日の目安。赤＝半分以上、黄＝3割以上）。</div>
                   {renderSymbolGrid(gridDates, pageMachines)}
                 </div>
 
