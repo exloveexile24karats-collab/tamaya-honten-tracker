@@ -6,9 +6,9 @@
 // =============================================================================
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine,
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine, ReferenceArea,
 } from "recharts";
-import { Trash2, Lock, X, ChevronDown, ChevronRight, Star, Flag, Plus } from "lucide-react";
+import { Trash2, Lock, X, ChevronDown, ChevronRight, Star, Flag, Plus, Pencil, ListChecks, RotateCcw } from "lucide-react";
 import { storage } from "./storage";
 
 // v0.1.0: 初版（プラザ2の形式＋指示書§4のエンジン＋本店用パーサー）
@@ -21,7 +21,13 @@ import { storage } from "./storage";
 //   イベント対象機種・ページの正式名称の両方で使用。新台用に手入力欄も残す。
 // v0.2.2: 全体データに「イベントを選んで過去を見る」を追加（プラザ2にあった機能の入れ忘れ）。
 //   日別の総差枚・マーク機種・🎯対象機種の結果、機種別／末尾別のイベント日成績。「イベント無し」も選べる。
-export const APP_VERSION = "0.2.2";
+// v0.3.0: 機種ページをプラザ2と同じ構成に作り直し（v0.1.0で画面を独自に作ってしまい、
+//   プラザ2の機能が抜けていたため）。左列：このページのデータ／台番号×日付マトリクス表（イベント複数選択）／
+//   設定期待度マトリクス表。右列：差枚グラフ（10/20/30/60日足・全期間・期間指定、イベント・2/7のつく日・
+//   店休日の目印）／表示する台番（全選択・全解除・過去の台番）／日別データ＋この日までの差枚推移
+//   （7/10/20/30日間）＋この日までの期待度表／台別チャート／〇のつく日／ピックアップ／台同士の相関／
+//   総差枚しきい値分析。スマホ表示も全体で見直し（全体データの推移表が潰れていた不具合を修正）。
+export const APP_VERSION = "0.3.0";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -670,6 +676,58 @@ export function scoreSymbolPickupToday(ctx, learned, closedSet) {
   return { target, lastDate: ctx.dates[lastDi], list };
 }
 
+// ---- 機種ページの分析（プラザ2から移植）----
+export const EMPTY = Object.freeze([]);
+export function pearsonCorrelation(xs, ys) {
+  const n = xs.length;
+  if (n < 8) return null;
+  const mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0, dx2 = 0, dy2 = 0;
+  for (let i = 0; i < n; i++) { const dx = xs[i] - mx, dy = ys[i] - my; num += dx * dy; dx2 += dx * dx; dy2 += dy * dy; }
+  if (!dx2 || !dy2) return null;
+  return num / Math.sqrt(dx2 * dy2);
+}
+export function buildTrailingPairs(series, w) {
+  const pairs = [];
+  for (let k = w - 1; k < series.length - 1; k++) {
+    let sum = 0;
+    for (let j = k - w + 1; j <= k; j++) sum += series[j].sada;
+    pairs.push({ trailingSum: sum, nextSada: series[k + 1].sada, nextDate: series[k + 1].date });
+  }
+  return pairs;
+}
+export function findBestThresholds(pairs, minSample = 5, baseRate = 0.5) {
+  if (pairs.length < minSample) return null;
+  const ts = Array.from(new Set(pairs.map((p) => p.trailingSum))).sort((a, b) => a - b);
+  let bestAbove = null, bestBelow = null;
+  const evalSet = (arr) => ({ winRate: arr.filter((p) => p.nextSada > 0).length / arr.length, avgNext: arr.reduce((a, p) => a + p.nextSada, 0) / arr.length });
+  ts.forEach((T) => {
+    const above = pairs.filter((p) => p.trailingSum >= T);
+    if (above.length >= minSample) {
+      const e = evalSet(above);
+      if (e.winRate > baseRate && (!bestAbove || e.winRate > bestAbove.winRate || (e.winRate === bestAbove.winRate && above.length > bestAbove.sampleSize))) bestAbove = { threshold: T, sampleSize: above.length, ...e };
+    }
+    const below = pairs.filter((p) => p.trailingSum <= T);
+    if (below.length >= minSample) {
+      const e = evalSet(below);
+      if (e.winRate > baseRate && (!bestBelow || e.winRate > bestBelow.winRate || (e.winRate === bestBelow.winRate && below.length > bestBelow.sampleSize))) bestBelow = { threshold: T, sampleSize: below.length, ...e };
+    }
+  });
+  return { totalPairs: pairs.length, bestAbove, bestBelow };
+}
+export function computeBaseRate(series) {
+  if (!series.length) return 0.5;
+  return series.filter((x) => x.sada > 0).length / series.length;
+}
+// カテゴリ軸では1日の幅が0なので、隣の日まで広げて帯を見えるようにする
+export function getBandRange(dateList, date) {
+  const i = dateList.indexOf(date);
+  if (i === -1) return null;
+  if (i < dateList.length - 1) return { x1: date, x2: dateList[i + 1] };
+  if (i > 0) return { x1: dateList[i - 1], x2: date };
+  return { x1: date, x2: date };
+}
+
 // ウォークフォワード・バックテスト（前日までのデータだけで学習→翌日の結果と照合）
 // 結果の記号は全期間で作った ctx の記号を正解として使う。
 export function walkForwardBacktest(pageDays, opts, closedSet, warmup = 20) {
@@ -715,6 +773,12 @@ const KV_DEFAULTS = {
   [KEYS.eventTargets]: {}, [KEYS.dateEventTargets]: {},
 };
 const NO_EVENT_LABEL = "イベント無し";
+const DIGIT2_COLOR = "#7dcfff";
+const DIGIT7_COLOR = "#f6a04d";
+const RANGE_OPTIONS = [
+  { key: 10, label: "10日足" }, { key: 20, label: "20日足" }, { key: 30, label: "30日足" },
+  { key: 60, label: "60日足" }, { key: "all", label: "全期間" },
+];
 const SYMBOL_COLORS = { "☆": "#e5484d", "〇": "#f2d24b", "▽": "#9ece6a", "□": "#7aa2f7", "×": "#5a6272", "－": "#2f3644" };
 const GRADE_COLORS = { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#e5697a" };
 const PALETTE = ["#e8b34c", "#4fd1c5", "#e5697a", "#7aa2f7", "#9ece6a", "#bb9af7", "#f6a04d", "#5fd3bc", "#e0af68", "#7dcfff"];
@@ -765,14 +829,14 @@ function serializeAnaslo(rows) {
 }
 
 const S = {
-  card: { background: "#1b212b", border: "1px solid #2a323f", borderRadius: 10, padding: 16, marginBottom: 14, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" },
+  card: { background: "#1b212b", border: "1px solid #2a323f", borderRadius: 10, padding: 14, marginBottom: 14, minWidth: 0, maxWidth: "100%", boxSizing: "border-box" },
   h: { fontSize: 13, fontWeight: 700, color: "#c7cbd4", marginBottom: 4 },
   note: { fontSize: 11, color: "#5a6272", marginBottom: 10, lineHeight: 1.6 },
   input: { background: "#12161d", border: "1px solid #2a323f", borderRadius: 6, padding: "7px 8px", color: "#e7e9ee", fontSize: 13, boxSizing: "border-box", maxWidth: "100%" },
   textarea: { width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: 6, padding: 8, color: "#d7dae0", fontSize: 11.5, lineHeight: 1.5, resize: "vertical", boxSizing: "border-box", marginBottom: 10, fontFamily: "'JetBrains Mono','Menlo',monospace" },
   btn: (bg, fg = "#12161d") => ({ background: bg, color: fg, border: "none", borderRadius: 8, padding: "9px 12px", fontWeight: 700, fontSize: 13, cursor: "pointer" }),
   ghost: { background: "none", border: "1px solid #2a323f", borderRadius: 6, color: "#8b93a3", padding: "5px 10px", fontSize: 11, cursor: "pointer" },
-  row: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontSize: 12, background: "#12161d", border: "1px solid #232b37", borderRadius: 6, padding: "6px 8px" },
+  row: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap", fontSize: 12, background: "#12161d", border: "1px solid #232b37", borderRadius: 6, padding: "6px 8px", minWidth: 0, wordBreak: "break-all" },
   th: { padding: "4px 6px", color: "#5a6272", fontWeight: 600, textAlign: "left", whiteSpace: "nowrap", borderBottom: "1px solid #2a323f" },
   td: { padding: "4px 6px", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap" },
 };
@@ -780,10 +844,10 @@ function Status({ s }) {
   if (!s) return null;
   return <div style={{ marginTop: 8, fontSize: 11.5, color: s.type === "ok" ? "#9ece6a" : s.type === "warn" ? "#e8b34c" : "#e5697a", whiteSpace: "pre-wrap" }}>{s.msg}</div>;
 }
-function Collapse({ title, defaultOpen = false, children, right }) {
+function Collapse({ title, defaultOpen = false, children, right, flush }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div style={S.card}>
+    <div style={flush ? { ...S.card, marginBottom: 0 } : S.card}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
         <button onClick={() => setOpen((v) => !v)} style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", color: "#c7cbd4", fontWeight: 700, fontSize: 13, cursor: "pointer", padding: 0, textAlign: "left" }}>
           {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}{title}
@@ -1410,48 +1474,205 @@ export default function App() {
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
   const machineLabel = (m) => (isMultiModel ? `${m.model} ${m.no}番` : `${m.no}番`);
 
-  // ページ内の表示設定
+  // ページ内の表示設定（v0.3.0：プラザ2の機種ページと同じ構成）
   const [showPast, setShowPast] = useState(false);
-  const [gridEvent, setGridEvent] = useState("");
+  const [gridEventFilter, setGridEventFilter] = useState([]); // イベント複数選択（マトリクス表の絞り込み）
   const [range, setRange] = useState(30);
+  const [useCustomRange, setUseCustomRange] = useState(false);
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
   const [selected, setSelected] = useState([]);
   const [viewDate, setViewDate] = useState("");
+  const [viewWindow, setViewWindow] = useState(7);
+  const [luckyDigit, setLuckyDigit] = useState(null);
+  const [analysisWindow, setAnalysisWindow] = useState(10);
   const [expandedPick, setExpandedPick] = useState({});
-  useEffect(() => { setSelected([]); setViewDate(""); setExpandedPick({}); setShowPast(false); setGridEvent(""); }, [activePageId]);
+  const [dateListOpen, setDateListOpen] = useState(false);
+  const [confirmDeleteDate, setConfirmDeleteDate] = useState(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [pageStatus, setPageStatus] = useState(null);
+  useEffect(() => {
+    setSelected([]); setViewDate(""); setExpandedPick({}); setShowPast(false); setGridEventFilter([]);
+    setUseCustomRange(false); setLuckyDigit(null); setConfirmDeleteDate(null); setConfirmReset(false); setPageStatus(null);
+  }, [activePageId]);
 
-  const lastPageDi = engine ? engine.ctx.dates.length - 1 : -1;
-  const pageMachines = useMemo(() => {
-    if (!engine) return [];
-    const arr = [...engine.ctx.machines.values()].filter((m) => showPast || (m.recs.length && m.recs[m.recs.length - 1].di === lastPageDi));
-    return arr.sort((a, b) => a.no - b.no || a.model.localeCompare(b.model));
-  }, [engine, showPast, lastPageDi]);
-  const activeKeys = useMemo(() => (engine ? [...engine.ctx.machines.values()].filter((m) => m.recs.length && m.recs[m.recs.length - 1].di === lastPageDi).map((m) => m.key) : []), [engine, lastPageDi]);
-  useEffect(() => { if (!selected.length && activeKeys.length) setSelected(activeKeys.slice(0, 6)); }, [activeKeys, selected.length]);
+  const pageDates = engine ? engine.ctx.dates : EMPTY;
+  const lastPageDi = pageDates.length - 1;
+  const lastPageDate = pageDates.length ? pageDates[lastPageDi] : "";
+  // 台 key → (日付 → 記録)
+  const recIndex = useMemo(() => {
+    const idx = new Map();
+    if (engine) engine.ctx.machines.forEach((m) => idx.set(m.key, new Map(m.recs.map((r) => [r.date, r]))));
+    return idx;
+  }, [engine]);
+  const recOf = useCallback((key, date) => { const mm = recIndex.get(key); return mm ? mm.get(date) || null : null; }, [recIndex]);
+  const recAt = useCallback((m, date) => recOf(m.key, date), [recOf]);
+  const sortMachines = (arr) => arr.sort((a, b) => a.no - b.no || a.model.localeCompare(b.model));
+  const activeMachines = useMemo(() => (engine ? sortMachines([...engine.ctx.machines.values()].filter((m) => m.recs.length && m.recs[m.recs.length - 1].di === lastPageDi)) : EMPTY), [engine, lastPageDi]);
+  const allMachines = useMemo(() => (engine ? sortMachines([...engine.ctx.machines.values()]) : EMPTY), [engine]);
+  const pageMachines = showPast ? allMachines : activeMachines; // 「表示する台番」の候補・マトリクス表の行
+  const machineByKey = useMemo(() => new Map(allMachines.map((m) => [m.key, m])), [allMachines]);
+  // 最初の6台を選ぶのはページを開いた時の1回だけ（全解除した後に勝手に選び直さない）
+  const autoSelectedFor = useRef(null);
+  useEffect(() => {
+    if (autoSelectedFor.current === activePageId || !activeMachines.length) return;
+    autoSelectedFor.current = activePageId;
+    setSelected(activeMachines.slice(0, 6).map((m) => m.key));
+  }, [activeMachines, activePageId]);
+  const effViewDate = viewDate || lastPageDate;
+
+  // マトリクス表の日付（イベント複数選択で絞り込み。未選択なら直近30日）新しい日が左
   const gridDates = useMemo(() => {
-    if (!engine) return [];
-    let ds = engine.ctx.dates;
-    if (gridEvent === NO_EVENT_LABEL) ds = ds.filter((d) => !eventsOn(d).length);
-    else if (gridEvent) ds = ds.filter((d) => eventsOn(d).includes(gridEvent));
-    else ds = ds.slice(-30);
-    return [...ds].reverse();
-  }, [engine, gridEvent, eventsOn]);
-  const recAt = useCallback((m, date) => m.recs.find((r) => r.date === date) || null, []);
-  const chartData = useMemo(() => {
-    if (!engine) return [];
-    const ds = range === "all" ? engine.ctx.dates : engine.ctx.dates.slice(-range);
-    const cum = {};
-    return ds.map((d) => {
-      const row = { date: d.slice(5) };
-      selected.forEach((k) => {
-        const m = engine.ctx.machines.get(k);
-        if (!m) return;
-        const r = recAt(m, d);
-        if (r && r.s !== null) cum[k] = (cum[k] || 0) + r.s;
-        row[k] = cum[k] === undefined ? null : cum[k];
+    let ds;
+    if (gridEventFilter.length) {
+      ds = pageDates.filter((d) => {
+        const names = eventsOn(d);
+        if (!names.length) return gridEventFilter.includes(NO_EVENT_LABEL);
+        return names.some((n) => gridEventFilter.includes(n));
       });
-      return row;
+    } else ds = pageDates.slice(-30);
+    return [...ds].reverse();
+  }, [pageDates, gridEventFilter, eventsOn]);
+
+  // グラフの日付軸（データのある日＋その間の店休日）
+  const timelineDates = useMemo(() => {
+    if (!pageDates.length) return EMPTY;
+    const first = pageDates[0], last = pageDates[lastPageDi];
+    const set = new Set(pageDates);
+    closedSet.forEach((d) => { if (d >= first && d <= last) set.add(d); });
+    return [...set].sort();
+  }, [pageDates, lastPageDi, closedSet]);
+  const visibleDates = useMemo(() => {
+    if (useCustomRange && customStart && customEnd) return timelineDates.filter((d) => d >= customStart && d <= customEnd);
+    if (range === "all") return timelineDates;
+    // 「○日足」はデータのある日で数える（店休日は数に入れない）
+    const dataDays = timelineDates.filter((d) => !closedSet.has(d));
+    const start = dataDays.length > range ? dataDays[dataDays.length - range] : dataDays[0];
+    return timelineDates.filter((d) => d >= start);
+  }, [timelineDates, range, useCustomRange, customStart, customEnd, closedSet]);
+  const chartData = useMemo(() => visibleDates.map((date) => {
+    const row = { date, event: eventsOn(date).join("、"), closed: closedSet.has(date) };
+    selected.forEach((k) => { const r = recOf(k, date); row[k] = r && r.s !== null ? r.s : null; });
+    return row;
+  }), [visibleDates, selected, recOf, eventsOn, closedSet]);
+  const chartMarks = useMemo(() => {
+    const out = { closed: [], d2: [], d7: [], strong: [], semi: [], ev: [] };
+    visibleDates.forEach((d) => {
+      if (closedSet.has(d)) out.closed.push(d);
+      const dd = parseInt(d.slice(8, 10), 10) % 10;
+      if (dd === 2) out.d2.push(d);
+      if (dd === 7) out.d7.push(d);
+      const names = eventsOn(d);
+      if (!names.length) return;
+      if (isStrong(d)) out.strong.push({ date: d, name: names.find((n) => strongNames.has(n)) || names[0] });
+      else if (isSemi(d)) out.semi.push({ date: d, name: names.find((n) => semiNames.has(n)) || names[0] });
+      else out.ev.push({ date: d, name: names[0] });
     });
-  }, [engine, range, selected, recAt]);
+    return out;
+  }, [visibleDates, closedSet, eventsOn, isStrong, isSemi, strongNames, semiNames]);
+  // 台別チャート（選んだ期間の累計差枚）
+  const cumSeries = useCallback((key, dates) => {
+    let cum = 0, started = false, last = null;
+    const raw = dates.map((date) => {
+      const r = recOf(key, date);
+      if (r && r.s !== null) { cum += r.s; started = true; last = date; }
+      return { date, value: started ? cum : null };
+    });
+    const series = raw.map((pt) => (last && pt.date > last ? { ...pt, value: null } : pt));
+    return { series, total: cum, count: raw.filter((pt, i) => { const r = recOf(key, dates[i]); return r && r.s !== null; }).length };
+  }, [recOf]);
+  const machineSummaries = useMemo(() => selected.map((k) => {
+    const m = machineByKey.get(k);
+    if (!m) return null;
+    return { key: k, m, ...cumSeries(k, visibleDates) };
+  }).filter(Boolean), [selected, machineByKey, cumSeries, visibleDates]);
+  // 日別データ＋この日までの差枚推移（7/10/20/30日間）
+  const viewDateList = useMemo(() => (effViewDate ? allMachines.map((m) => ({ m, r: recOf(m.key, effViewDate) })).filter((x) => x.r) : EMPTY), [allMachines, recOf, effViewDate]);
+  const viewWindowDates = useMemo(() => pageDates.filter((d) => d <= effViewDate).slice(-viewWindow), [pageDates, effViewDate, viewWindow]);
+  const viewWindowSeries = useMemo(() => viewDateList.map(({ m }) => {
+    const { series, total } = cumSeries(m.key, viewWindowDates);
+    const zero = viewWindowDates.length ? [{ date: addDays(viewWindowDates[0], -1), value: 0 }] : [];
+    return { key: m.key, m, total, series: [...zero, ...series] };
+  }), [viewDateList, viewWindowDates, cumSeries]);
+  // 〇のつく日 平均差枚（全期間）
+  const luckyDay = useMemo(() => {
+    if (luckyDigit === null) return null;
+    const ds = pageDates.filter((d) => parseInt(d.slice(8, 10), 10) % 10 === luckyDigit);
+    if (!ds.length) return { stats: [], dayCount: 0, avgTotal: null };
+    const stats = allMachines.map((m) => {
+      let sum = 0, n = 0;
+      ds.forEach((d) => { const r = recOf(m.key, d); if (r && r.s !== null) { sum += r.s; n += 1; } });
+      return n ? { key: m.key, m, avg: sum / n, count: n } : null;
+    }).filter(Boolean).sort((a, b) => b.avg - a.avg);
+    const totals = ds.map((d) => allMachines.reduce((a, m) => { const r = recOf(m.key, d); return a + (r && r.s !== null ? r.s : 0); }, 0));
+    return { stats, dayCount: ds.length, avgTotal: totals.reduce((a, b) => a + b, 0) / totals.length };
+  }, [luckyDigit, pageDates, allMachines, recOf]);
+  // 台同士の相関
+  const machineCorrelations = useMemo(() => {
+    if (viewMode !== "page") return EMPTY;
+    const maps = pageMachines.map((m) => ({ m, map: recIndex.get(m.key) }));
+    const out = [];
+    for (let i = 0; i < maps.length; i++) for (let j = i + 1; j < maps.length; j++) {
+      const A = maps[i], B = maps[j];
+      const xs = [], ys = [];
+      A.map.forEach((ra, d) => { const rb = B.map.get(d); if (rb && ra.s !== null && rb.s !== null) { xs.push(ra.s); ys.push(rb.s); } });
+      if (xs.length < 10) continue;
+      const r = pearsonCorrelation(xs, ys);
+      if (r !== null && Math.abs(r) >= 0.4) out.push({ a: A.m, b: B.m, r, n: xs.length });
+    }
+    return out.sort((x, y) => Math.abs(y.r) - Math.abs(x.r)).slice(0, 60);
+  }, [viewMode, pageMachines, recIndex]);
+  // 総差枚しきい値分析
+  const thresholdAnalyses = useMemo(() => selected.map((k) => {
+    const m = machineByKey.get(k);
+    if (!m) return null;
+    const series = m.recs.filter((r) => r.s !== null).map((r) => ({ date: r.date, sada: r.s }));
+    const baseRate = computeBaseRate(series);
+    const pairs = buildTrailingPairs(series, analysisWindow);
+    const d2 = pairs.filter((p) => parseInt(p.nextDate.slice(8, 10), 10) % 10 === 2);
+    const d7 = pairs.filter((p) => parseInt(p.nextDate.slice(8, 10), 10) % 10 === 7);
+    return { key: k, m, baseRate, validDays: series.length, overall: findBestThresholds(pairs, 5, baseRate), digit2: findBestThresholds(d2, 3, baseRate), digit7: findBestThresholds(d7, 3, baseRate), nAll: pairs.length, n2: d2.length, n7: d7.length };
+  }).filter(Boolean), [selected, machineByKey, analysisWindow]);
+
+  // このページのデータ（日付単位の削除・全削除）。アナスロ保存データから、このページの機種の行だけを消す。
+  async function rewriteRawDays(updates) {
+    const next = { ...rawRef.current };
+    Object.entries(updates).forEach(([d, v]) => { if (v) next[d] = v; else delete next[d]; });
+    rawRef.current = next;
+    const weeks = Array.from(new Set(Object.keys(updates).map(weekStartOf)));
+    for (const w of weeks) {
+      const bucket = {};
+      Object.keys(next).forEach((d) => { if (weekStartOf(d) === w) bucket[d] = next[d]; });
+      if (Object.keys(bucket).length) await storage.set(RAW_PREFIX + w, JSON.stringify(bucket));
+      else await storage.delete(RAW_PREFIX + w);
+    }
+    await storage.set(RAW_INDEX, JSON.stringify(Object.keys(next).sort()));
+    setRaw(next);
+  }
+  function withoutPageRows(date) {
+    const rows = unpackDay(rawRef.current[date]);
+    const rest = rows.filter((r) => !pageNameKeys.has(resolve(effectiveModelName(r, noModel))));
+    return { removed: rows.length - rest.length, packed: rest.length ? packDay(rest) : null };
+  }
+  async function deletePageDate(date) {
+    const prev = rawRef.current[date];
+    const { removed, packed } = withoutPageRows(date);
+    try {
+      await rewriteRawDays({ [date]: packed });
+      pushUndo({ label: `${currentPage.name || "ページ"} ${date} の${removed}台分を削除`, kind: "raw", date, prev });
+      setPageStatus({ type: "ok", msg: `${date} のこのページのデータ（${removed}台）を削除しました。` });
+    } catch (e) { setPageStatus({ type: "error", msg: `削除に失敗しました：${errMsg(e)}` }); }
+    setConfirmDeleteDate(null);
+  }
+  async function resetPageData() {
+    const updates = {};
+    pageDates.forEach((d) => { updates[d] = withoutPageRows(d).packed; });
+    try {
+      await rewriteRawDays(updates);
+      setPageStatus({ type: "ok", msg: `このページのデータ（${pageDates.length}日分）を削除しました。` });
+    } catch (e) { setPageStatus({ type: "error", msg: `削除に失敗しました：${errMsg(e)}` }); }
+    setConfirmReset(false);
+  }
 
   // =========================================================================
   // 全体データ（民レポ）
@@ -1527,42 +1748,58 @@ export default function App() {
     return `${md(t)}のピックアップ（実測パターン方式）${skipped.length ? `　※${skipped.join("・")}は店休日` : ""}`;
   })() : "ピックアップ（実測パターン方式）";
 
-  const renderSymbolGrid = () => (
-    <div className="scrollbar" style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+  // ---- 機種ページの部品（プラザ2と同じ見た目）----
+  const toggleEventFilter = (name) => setGridEventFilter((l) => (l.includes(name) ? l.filter((n) => n !== name) : [...l, name]));
+  const renderEventMultiSelect = () => (
+    <div className="scrollbar" style={{ maxHeight: 120, overflowY: "auto", display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10, padding: 8, background: "#12161d", border: "1px solid #2a323f", borderRadius: 6 }}>
+      {[NO_EVENT_LABEL, ...allEventNames].map((n) => {
+        const active = gridEventFilter.includes(n);
+        const noEv = n === NO_EVENT_LABEL;
+        return (
+          <button key={n} onClick={() => toggleEventFilter(n)} style={{
+            fontSize: 11, padding: "4px 9px", borderRadius: 999, cursor: "pointer",
+            border: active ? `1px solid ${noEv ? "#8b93a3" : "#7aa2f7"}` : noEv ? "1px dashed #3a4353" : "1px solid #2a323f",
+            background: active ? (noEv ? "rgba(139,147,163,0.15)" : "rgba(122,162,247,0.15)") : "transparent",
+            color: active ? (noEv ? "#c7cbd4" : "#7aa2f7") : "#8b93a3",
+          }}>{n}</button>
+        );
+      })}
+    </div>
+  );
+  const gridHeadCell = (d) => (
+    <th key={d} className="mono" style={{ background: "#12161d", padding: "4px 3px", borderBottom: "1px solid #2a323f", fontSize: 9, whiteSpace: "nowrap", color: isStrong(d) ? "#e5484d" : isSemi(d) ? "#9ece6a" : eventsOn(d).length ? "#f2d24b" : "#5a6272" }}>{d.slice(5)}</th>
+  );
+  const rowHeadStyle = { position: "sticky", left: 0, zIndex: 1, background: "#12161d", color: "#c7cbd4", padding: "4px 8px", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 112, boxSizing: "border-box" };
+  const renderSymbolGrid = (dates, list) => (!list.length || !dates.length ? <div style={{ fontSize: 12, color: "#5a6272" }}>表示できるデータがまだありません。</div> : (
+    <div className="scrollbar" style={{ overflowX: "auto", maxWidth: "100%", WebkitOverflowScrolling: "touch", overscrollBehaviorX: "contain" }}>
       <table style={{ borderCollapse: "collapse", fontSize: 11 }}>
-        <thead><tr>
-          <th style={{ ...S.th, position: "sticky", left: 0, background: "#1b212b", zIndex: 1 }} />
-          {gridDates.map((d) => <th key={d} className="mono" style={{ ...S.th, fontSize: 9, textAlign: "center", color: isStrong(d) ? "#e5484d" : eventsOn(d).length ? "#f2d24b" : "#5a6272" }}>{d.slice(5)}</th>)}
-        </tr></thead>
-        <tbody>{pageMachines.map((m) => (
+        <thead><tr><th style={{ ...rowHeadStyle, zIndex: 2, borderBottom: "1px solid #2a323f" }} />{dates.map(gridHeadCell)}</tr></thead>
+        <tbody>{list.map((m) => (
           <tr key={m.key}>
-            <td title={machineLabel(m)} style={{ ...S.td, position: "sticky", left: 0, background: "#1b212b", color: "#c7cbd4", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>{machineLabel(m)}</td>
-            {gridDates.map((d) => { const r = recAt(m, d); return (
-              <td key={d} className="mono" title={r ? `G${fmt(r.g)} 差枚${fmtSigned(r.s)} BB${r.bb ?? "-"} RB${r.rb ?? "-"}${r.src === "m" ? "（代用）" : ""}` : ""} style={{ ...S.td, textAlign: "center", color: r ? SYMBOL_COLORS[r.sym] : "#2a323f", fontWeight: 700, textDecoration: r && r.src === "m" ? "underline dotted" : undefined, background: isTargetOn(d, m.modelKey) ? "rgba(232,179,76,0.13)" : undefined }}>{r ? r.sym : "・"}</td>
+            <td title={machineLabel(m)} style={rowHeadStyle}>{machineLabel(m)}</td>
+            {dates.map((d) => { const r = recAt(m, d); return (
+              <td key={d} className="mono" title={r ? `G${fmt(r.g)} 差枚${fmtSigned(r.s)} BB${r.bb ?? "-"} RB${r.rb ?? "-"}${r.src === "m" ? "（代用）" : ""}` : ""} style={{ padding: "4px 3px", borderBottom: "1px solid #1c2129", textAlign: "center", color: r ? SYMBOL_COLORS[r.sym] : "#2a323f", fontWeight: 700, textDecoration: r && r.src === "m" ? "underline dotted" : undefined, background: isTargetOn(d, m.modelKey) ? "rgba(232,179,76,0.13)" : undefined }}>{r ? r.sym : "・"}</td>
             ); })}
           </tr>
         ))}</tbody>
       </table>
     </div>
-  );
-  const renderExpGrid = (dates, list) => (
-    <div className="scrollbar" style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+  ));
+  const renderExpGrid = (dates, list) => (!list.length || !dates.length ? <div style={{ fontSize: 12, color: "#5a6272" }}>表示できるデータがまだありません。</div> : (
+    <div className="scrollbar" style={{ overflowX: "auto", maxWidth: "100%", WebkitOverflowScrolling: "touch", overscrollBehaviorX: "contain" }}>
       <table style={{ borderCollapse: "collapse", fontSize: 11 }}>
-        <thead><tr>
-          <th style={{ ...S.th, position: "sticky", left: 0, background: "#1b212b", zIndex: 1 }} />
-          {dates.map((d) => <th key={d} className="mono" style={{ ...S.th, fontSize: 9, textAlign: "center" }}>{d.slice(5)}</th>)}
-        </tr></thead>
+        <thead><tr><th style={{ ...rowHeadStyle, zIndex: 2, borderBottom: "1px solid #2a323f" }} />{dates.map(gridHeadCell)}</tr></thead>
         <tbody>{list.map((m) => (
           <tr key={m.key}>
-            <td style={{ ...S.td, position: "sticky", left: 0, background: "#1b212b", color: "#c7cbd4", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>{machineLabel(m)}</td>
+            <td title={machineLabel(m)} style={rowHeadStyle}>{machineLabel(m)}</td>
             {dates.map((d) => {
               const r = recAt(m, d);
               const e = r && r.exp;
-              if (!e) return <td key={d} style={{ ...S.td, textAlign: "center", color: "#2a323f" }}>・</td>;
+              if (!e) return <td key={d} style={{ padding: "4px 3px", borderBottom: "1px solid #1c2129", textAlign: "center", color: "#2a323f" }}>・</td>;
               const v = Math.round(e.score * 100);
               return (
-                <td key={d} className="mono" title={`期待度${v}　生の読み取り${Math.round(e.raw * 100)}　信頼度${e.confidence.toFixed(2)}　G${fmt(r.g)}`} style={{ ...S.td, textAlign: "center", color: fiveBandColor(v) }}>
-                  {e.lowGsuFlag && <span style={{ fontSize: 8 }}>▼</span>}{v}<sub style={{ fontSize: 8, color: "#5a6272" }}>{Math.round(e.raw * 100)}</sub>
+                <td key={d} className="mono" title={`期待度${v}　生の読み取り${Math.round(e.raw * 100)}　信頼度${e.confidence.toFixed(2)}　G${fmt(r.g)}`} style={{ padding: "4px 3px", borderBottom: "1px solid #1c2129", textAlign: "center", color: fiveBandColor(v), background: isTargetOn(d, m.modelKey) ? "rgba(232,179,76,0.13)" : undefined }}>
+                  <span style={{ display: "inline-flex", alignItems: "baseline", gap: 1 }}>{e.lowGsuFlag && <span style={{ fontSize: 8 }}>▼</span>}<span>{v}</span><sub style={{ fontSize: 8, color: "#5a6272" }}>{Math.round(e.raw * 100)}</sub></span>
                 </td>
               );
             })}
@@ -1570,10 +1807,41 @@ export default function App() {
         ))}</tbody>
       </table>
     </div>
+  ));
+  const chipBtn = (active) => ({ fontSize: 12, padding: "6px 10px", borderRadius: 6, cursor: "pointer", border: `1px solid ${active ? "#4fd1c5" : "#2a323f"}`, background: active ? "rgba(79,209,197,0.12)" : "transparent", color: active ? "#4fd1c5" : "#c7cbd4" });
+  const MiniChart = ({ title, series, total, height, axis, marks }) => (
+    <div style={{ background: "#0e1218", border: "1px solid #232b37", borderRadius: 10, overflow: "hidden", minWidth: 0 }}>
+      <div className="mono" style={{ background: "#e7e9ee", color: "#12161d", fontWeight: 700, fontSize: 12, textAlign: "center", padding: "3px 4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>[{title}]</div>
+      <div style={{ position: "relative", height }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={series} margin={{ top: 8, right: 6, left: 0, bottom: 0 }}>
+            <CartesianGrid vertical={false} stroke="#232b37" strokeDasharray="2 3" />
+            <YAxis hide={!axis} width={axis ? 36 : 0} tick={{ fontSize: 9, fill: "#4a5262" }} axisLine={false} tickLine={false} />
+            <XAxis dataKey="date" hide />
+            <Tooltip contentStyle={{ background: "#1b212b", border: "1px solid #2a323f", borderRadius: 6, fontSize: 11 }} />
+            {marks && marks.closed.map((d) => { const band = getBandRange(series.map((x) => x.date), d); return band ? <ReferenceArea key={`c${d}`} x1={band.x1} x2={band.x2} fill="#5a6272" fillOpacity={0.28} stroke="none" /> : null; })}
+            {marks && marks.d2.map((d) => <ReferenceLine key={`2${d}`} x={d} stroke={DIGIT2_COLOR} strokeDasharray="2 2" strokeOpacity={0.5} />)}
+            {marks && marks.d7.map((d) => <ReferenceLine key={`7${d}`} x={d} stroke={DIGIT7_COLOR} strokeDasharray="2 2" strokeOpacity={0.5} />)}
+            {marks && marks.strong.map((x) => <ReferenceLine key={`s${x.date}`} x={x.date} stroke="#e5484d" strokeDasharray="4 2" strokeWidth={1.5} />)}
+            <Line type="monotone" dataKey="value" stroke="#3ecf8e" strokeWidth={1.75} dot={false} connectNulls isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+        <div className="mono" style={{ position: "absolute", right: 6, bottom: 4, fontSize: axis ? 16 : 13, fontWeight: 800, color: "#f2d24b", textShadow: "0 0 8px rgba(242,210,75,0.35)" }}>{total === null ? "―" : `${total >= 0 ? "+" : ""}${Math.round(total).toLocaleString()}枚`}</div>
+      </div>
+    </div>
   );
+  const renderThresholdResult = (result, label, pairsCount, minSample) => {
+    if (!result) return <div style={{ fontSize: 11, color: "#5a6272", marginBottom: 6 }}>{label}：十分なデータがありません（有効な組み合わせ {pairsCount}件、最低{minSample}件必要）</div>;
+    const line = (b, dir) => (b ? (
+      <div style={{ fontSize: 12, color: "#c7cbd4" }}>
+        総差枚が <span className="mono" style={{ color: "#e8b34c" }}>{fmtSigned(b.threshold)}枚</span> {dir} → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(b.winRate * 100)}%</span>（{b.sampleSize}件中、平均{fmtSigned(b.avgNext)}枚）
+      </div>
+    ) : <div style={{ fontSize: 11, color: "#5a6272" }}>{dir}パターン：この台の基準勝率を上回るしきい値は見つかりませんでした</div>);
+    return <div style={{ marginBottom: 8 }}><div style={{ fontSize: 11, color: "#8b93a3", marginBottom: 2 }}>{label}</div>{line(result.bestAbove, "以上")}{line(result.bestBelow, "以下")}</div>;
+  };
 
   return (
-    <div style={{ fontFamily: "'Inter','Hiragino Sans',sans-serif", background: "#12161d", color: "#e7e9ee", minHeight: "100%", padding: "20px 16px 80px", boxSizing: "border-box" }}>
+    <div style={{ fontFamily: "'Inter','Hiragino Sans',sans-serif", background: "#12161d", color: "#e7e9ee", minHeight: "100%", padding: "20px max(12px, env(safe-area-inset-right)) 90px max(12px, env(safe-area-inset-left))", boxSizing: "border-box", overflowX: "hidden", maxWidth: "100vw" }}>
       <style>{`
         .mono { font-family: 'JetBrains Mono','Menlo',monospace; font-variant-numeric: tabular-nums; }
         input[type="date"] { color-scheme: dark; }
@@ -1582,7 +1850,17 @@ export default function App() {
         .tab { cursor: pointer; border: 1px solid #2a323f; border-radius: 8px 8px 0 0; padding: 8px 12px; font-size: 12px; font-weight: 700; background: #1b212b; color: #8b93a3; }
         .tab.active { background: #12161d; color: #e8b34c; border-bottom: 1px solid #12161d; }
         .grid2 { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 14px; }
-        @media (max-width: 860px) { .grid2 { grid-template-columns: minmax(0,1fr); } }
+        .tracker-grid { display: grid; grid-template-columns: minmax(0,380px) minmax(0,1fr); gap: 14px; align-items: start; }
+        .mini-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+        .mini-grid.wide { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+        table td, table th { box-sizing: border-box; }
+        @media (max-width: 860px) {
+          .grid2, .tracker-grid { grid-template-columns: minmax(0,1fr); }
+        }
+        @media (max-width: 520px) {
+          .mini-grid, .mini-grid.wide { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+          .tab { padding: 8px 10px; font-size: 12px; }
+        }
       `}</style>
       <datalist id="model-names">{knownModelNames.map((n) => <option key={n} value={n} />)}</datalist>
       <datalist id="event-names">{kv[KEYS.eventNames].map((n) => <option key={n} value={n} />)}</datalist>
@@ -1846,20 +2124,17 @@ export default function App() {
             <div style={S.card}>
               <div style={S.h}>📈 店全体の推移（民レポ）</div>
               <div style={S.note}>機種別の平均差枚×台数を全機種分（バラエティ含む）足し合わせています。</div>
-              <div className="scrollbar" style={{ maxHeight: 360, overflow: "auto" }}>
-                <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
-                  <thead><tr><th style={S.th}>日付</th><th style={{ ...S.th, textAlign: "right" }}>総差枚</th><th style={{ ...S.th, textAlign: "right" }}>平均差枚</th><th style={{ ...S.th, textAlign: "right" }}>平均G数</th><th style={{ ...S.th, textAlign: "right" }}>台数</th><th style={S.th}>マーク</th></tr></thead>
-                  <tbody>{dailyTotals.map((d) => (
-                    <tr key={d.date}>
-                      <td className="mono" style={S.td}>{d.date} <span style={{ color: "#5a6272" }}>{WD[weekdayOf(d.date)]}</span>{eventsOn(d.date).length > 0 && <span style={{ marginLeft: 4, fontSize: 10, color: isStrong(d.date) ? "#e5484d" : "#f2d24b" }}>{eventsOn(d.date).join("、")}</span>}</td>
-                      <td className="mono" style={{ ...S.td, textAlign: "right", color: d.total >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(d.total)}</td>
-                      <td className="mono" style={{ ...S.td, textAlign: "right", color: d.avg >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(d.avg)}</td>
-                      <td className="mono" style={{ ...S.td, textAlign: "right" }}>{fmt(d.avgG)}</td>
-                      <td className="mono" style={{ ...S.td, textAlign: "right", color: "#5a6272" }}>{d.n}</td>
-                      <td style={{ ...S.td, whiteSpace: "normal", fontSize: 11 }}>{d.marks.slice(0, 6).map((m, i) => <span key={i} style={{ color: markColor(m.mark), marginRight: 6 }}>{m.mark}{m.name}</span>)}{d.marks.length > 6 && <span style={{ color: "#5a6272" }}>他{d.marks.length - 6}</span>}</td>
-                    </tr>
-                  ))}</tbody>
-                </table>
+              <div className="scrollbar" style={{ maxHeight: 420, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+                {dailyTotals.map((d) => (
+                  <div key={d.date} style={{ background: "#12161d", border: "1px solid #232b37", borderRadius: 6, padding: "7px 9px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
+                      <span className="mono">{d.date}<span style={{ color: "#5a6272" }}>（{WD[weekdayOf(d.date)]}）</span>{eventsOn(d.date).length > 0 && <span style={{ marginLeft: 4, fontSize: 11, color: isStrong(d.date) ? "#e5484d" : isSemi(d.date) ? "#9ece6a" : "#f2d24b" }}>{eventsOn(d.date).join("、")}</span>}</span>
+                      <span className="mono">総差枚 <b style={{ color: (d.total ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(d.total)}</b></span>
+                    </div>
+                    <div className="mono" style={{ fontSize: 11, color: "#8b93a3", marginTop: 2 }}>1台平均 <span style={{ color: (d.avg ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(d.avg)}</span>　平均G {fmt(d.avgG)}　{d.n}台</div>
+                    {d.marks.length > 0 && <div style={{ fontSize: 11, marginTop: 3, lineHeight: 1.6 }}>{d.marks.map((m, i) => <span key={i} style={{ color: markColor(m.mark), marginRight: 8, display: "inline-block" }}>{m.mark}{m.name}</span>)}</div>}
+                  </div>
+                ))}
               </div>
             </div>
           )}
@@ -1999,21 +2274,25 @@ export default function App() {
         </div>
       )}
 
-      {/* =================================================================== 機種ページ */}
+      {/* =================================================================== 機種ページ（v0.3.0：プラザ2と同じ構成） */}
       {viewMode === "page" && currentPage && (
-        <div style={{ maxWidth: 1100 }}>
-          {unlocked && (
-            <div style={S.card}>
-              <div style={S.h}>ページの設定（編集画面）</div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
-                <input defaultValue={currentPage.name} key={`n-${currentPage.id}`} onBlur={(e) => e.target.value !== currentPage.name && updatePage(currentPage.id, { name: e.target.value })} placeholder="タブに出す名前（例：マイジャグ）" style={{ ...S.input, flex: "1 1 200px" }} />
+        <div>
+          {/* ページ名・正式名称（編集はロック解除時だけ） */}
+          {unlocked ? (
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                <Pencil size={14} color="#5a6272" />
+                <input defaultValue={currentPage.name} key={`n-${currentPage.id}`} onBlur={(e) => e.target.value !== currentPage.name && updatePage(currentPage.id, { name: e.target.value })} placeholder="ページ名（例：マイジャグ）"
+                  style={{ fontSize: 16, fontWeight: 700, background: "transparent", border: "none", borderBottom: "1px dashed #2a323f", color: "#e7e9ee", padding: "4px 2px", flex: "1 1 200px", minWidth: 0 }} />
                 <button style={{ ...S.ghost, color: "#e5697a" }} onClick={() => window.confirm("このページを削除しますか？（データ自体は消えません）") && deletePage(currentPage.id)}><Trash2 size={11} /> ページ削除</button>
               </div>
-              <div style={{ fontSize: 11, color: "#5a6272", marginBottom: 6 }}>正式名称（アナスロ・民レポの機種名。複数機種をまとめる時は1つずつ追加）</div>
+              <div style={{ fontSize: 11, color: "#5a6272", marginBottom: 6 }}>正式名称（アナスロ・民レポと連携。複数機種を束ねる場合は1つずつ追加）</div>
               <ModelChips icon="" options={modelOptions} resolve={resolve} names={splitNames(currentPage.officialName)}
                 onAdd={(n) => updatePage(currentPage.id, { officialName: joinNames([...splitNames(currentPage.officialName).filter((x) => !modelNamesMatch(x, n, resolve)), n.trim()]) })}
                 onRemove={(n) => updatePage(currentPage.id, { officialName: joinNames(splitNames(currentPage.officialName).filter((x) => x !== n)) })} />
             </div>
+          ) : (
+            <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 14 }}>{currentPage.name || "（無題）"}</div>
           )}
 
           {!pageNameKeys.size ? (
@@ -2021,143 +2300,304 @@ export default function App() {
           ) : !engine ? (
             <div style={S.card}><div style={S.note}>この機種のアナスロデータがまだありません。</div></div>
           ) : (
-            <>
-              <div style={S.card}>
-                <div style={{ ...S.h, fontSize: 14 }}>{pickTitle}</div>
-                <div style={S.note}>
-                  {engine.pick.lastDate}までのデータで予想。過去の「パターンに当てはまった台の翌日☆〇率 − 全体の☆〇率（基準{engine.learned.base !== null ? `${(engine.learned.base * 100).toFixed(1)}%` : "―"}）」を点数にして合計しています。学習済みパターン{engine.learned.weights.size}件（データ{engine.ctx.dates.length}日・サンプル数15未満のパターンは使いません）。
-                  グレード：S≥60 / A≥30 / B≥10 / C≥-10 / D≥-30 / E。
-                </div>
-                {engine.learned.weights.size === 0 && <div style={{ fontSize: 12, color: "#e8b34c", marginBottom: 10 }}>データ蓄積中です。サンプル数がそろったパターンから順に点数が付きます（それまでは全台0pt）。</div>}
-                <div className="scrollbar" style={{ maxHeight: 560, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
-                  {engine.pick.list.map((p) => {
-                    const m = engine.ctx.machines.get(p.key);
-                    const open = expandedPick[p.key];
-                    const items = open ? p.items : p.items.slice(0, 5);
-                    return (
-                      <div key={p.key} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: 8, padding: "9px 11px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                          <span className="mono" style={{ width: 22, height: 22, lineHeight: "22px", textAlign: "center", borderRadius: "50%", fontWeight: 800, color: "#12161d", background: GRADE_COLORS[p.grade] }}>{p.grade}</span>
-                          <span className="mono" style={{ fontWeight: 700, color: "#e8b34c" }}>{machineLabel(m)}</span>
-                          {p.targetEvents && p.targetEvents.length > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: "#12161d", background: "#e8b34c", borderRadius: 999, padding: "1px 8px" }}>🎯 {p.targetEvents.join("、")}の対象</span>}
-                          <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: p.points >= 0 ? "#9ece6a" : "#e5697a" }}>{p.points >= 0 ? "+" : ""}{p.points.toFixed(1)}pt</span>
-                          <span style={{ fontSize: 11, color: "#5a6272" }}>前日 <span style={{ color: SYMBOL_COLORS[p.lastSym], fontWeight: 700 }}>{p.lastSym}</span>{p.lastExp && <> ・期待度 <span style={{ color: fiveBandColor(Math.round(p.lastExp.score * 100)) }}>{Math.round(p.lastExp.score * 100)}</span></>}</span>
+            <div className="tracker-grid">
+              {/* ---------------- 左列 ---------------- */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
+                {unlocked ? (
+                  <div style={{ ...S.card, marginBottom: 0 }}>
+                    <div style={S.h}>このページのデータ</div>
+                    <div style={S.note}>データの入力は「🔧 共通設定」タブのアナスロから行います。正式名称が一致すると、ここには自動で反映されます。</div>
+                    <Status s={pageStatus} />
+                    <div style={{ marginTop: 12, borderTop: "1px solid #2a323f", paddingTop: 12 }}>
+                      <button onClick={() => setDateListOpen((v) => !v)} style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", fontSize: 12, fontWeight: 700, color: "#c7cbd4", background: "none", border: "none", cursor: "pointer", padding: 0, textAlign: "left", marginBottom: dateListOpen ? 8 : 0 }}>
+                        {dateListOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}登録済みの日付（{pageDates.length}件）
+                      </button>
+                      {dateListOpen && (
+                        <div className="scrollbar" style={{ maxHeight: 220, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+                          {[...pageDates].reverse().map((d) => (
+                            <div key={d} style={S.row}>
+                              <span>
+                                <span className="mono">{d}</span>
+                                {eventsOn(d).length > 0 && <span style={{ marginLeft: 6, color: isStrong(d) ? "#e5484d" : isSemi(d) ? "#9ece6a" : "#f2d24b" }}>{isStrong(d) ? "★" : isSemi(d) ? "🚩" : "☆"}{eventsOn(d).join("、")}</span>}
+                                <span style={{ marginLeft: 6, color: "#5a6272" }}>{allMachines.filter((m) => recOf(m.key, d)).length}台</span>
+                              </span>
+                              {confirmDeleteDate === d ? (
+                                <span style={{ display: "flex", gap: 8 }}>
+                                  <button onClick={() => deletePageDate(d)} style={{ fontSize: 11, color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
+                                  <button onClick={() => setConfirmDeleteDate(null)} style={{ fontSize: 11, color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
+                                </span>
+                              ) : (
+                                <button onClick={() => setConfirmDeleteDate(d)} title="この日のこのページのデータを削除" style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}><Trash2 size={13} /></button>
+                              )}
+                            </div>
+                          ))}
                         </div>
-                        {items.length > 0 && (
-                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 1 }}>
-                            {items.map((it) => (
-                              <div key={it.key} className="mono" style={{ fontSize: 11, display: "flex", justifyContent: "space-between", gap: 8, color: "#8b93a3" }}>
-                                <span>{it.label}<span style={{ color: "#5a6272" }}>：翌日☆〇 {(it.rate * 100).toFixed(1)}%（n={it.n}）</span></span>
-                                <span style={{ color: it.points >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700, whiteSpace: "nowrap" }}>{it.points >= 0 ? "+" : ""}{it.points.toFixed(1)}</span>
-                              </div>
-                            ))}
-                            {p.items.length > 5 && <button style={{ ...S.ghost, alignSelf: "flex-start", marginTop: 4, padding: "2px 8px" }} onClick={() => setExpandedPick((s) => ({ ...s, [p.key]: !open }))}>{open ? "閉じる" : `残り${p.items.length - 5}件を見る`}</button>}
+                      )}
+                      <div style={{ marginTop: 10 }}>
+                        {confirmReset ? (
+                          <div style={{ display: "flex", gap: 8, fontSize: 12, flexWrap: "wrap" }}>
+                            <span style={{ color: "#e5697a" }}>このページのデータを全て削除しますか？（元に戻せません）</span>
+                            <button onClick={resetPageData} style={{ color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>はい</button>
+                            <button onClick={() => setConfirmReset(false)} style={{ color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>いいえ</button>
                           </div>
+                        ) : (
+                          <button onClick={() => setConfirmReset(true)} style={{ fontSize: 11, color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}><RotateCcw size={11} />このページのデータをリセット</button>
                         )}
                       </div>
-                    );
-                  })}
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ ...S.card, marginBottom: 0, fontSize: 12, color: "#8b93a3", display: "flex", alignItems: "center", gap: 8 }}><Lock size={13} />データ入力はロック中です。「🔧 共通設定」タブで暗証番号を入力すると解除できます。</div>
+                )}
+
+                <div style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={S.h}>📋 台番号×日付マトリクス表</div>
+                  <div style={S.note}>台番号ごとに、日付ごとの記号を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。</div>
+                  {renderEventMultiSelect()}
+                  <div style={{ ...S.note, marginBottom: 8 }}><span style={{ color: SYMBOL_COLORS["☆"] }}>☆</span>＝読み取り上位20%＋プラス　<span style={{ color: SYMBOL_COLORS["〇"] }}>〇</span>＝上位50%＋プラス　<span style={{ color: SYMBOL_COLORS["▽"] }}>▽</span>＝上位50%だがマイナス　<span style={{ color: SYMBOL_COLORS["□"] }}>□</span>＝中間　<span style={{ color: "#8b93a3" }}>×</span>＝推定低設定（下位20%）　－＝判定不可（回転数不足）。点線の下線は個別台の代用データ。黄色い背景＝その日のイベント対象機種🎯。日付の色：赤＝強いイベント・緑＝準イベント・黄＝イベント。</div>
+                  {renderSymbolGrid(gridDates, pageMachines)}
+                </div>
+
+                <div style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={S.h}>🎰 設定期待度マトリクス表</div>
+                  <div style={S.note}>
+                    大きい数字＝設定期待度（0〜100、回転数が少ないほど0側に寄せた値）、右下の小さい数字＝寄せる前の生の読み取り。<span style={{ color: "#e8b34c" }}>▼</span>＝回転数が少ないのに出ている台（設定ではなく展開の可能性）。色：赤75以上／黄60／緑45／青30／灰。日付・イベントの絞り込みは上の表と共通です。
+                    {[...engine.ctx.modelCtx.values()].map((c) => (
+                      <div key={c.key}>・{displayNameOf[c.key] || c.key}：{c.profile ? "確率表あり（設定判別）" : "確率表なし（店内の合算確率の順位で暫定判定）"}・G数は{c.gtype === "normal" ? "通常時（上限3900）" : c.gtype === "total" ? "総回転数（上限8000）" : "未判定（上限3900で計算）"}</div>
+                    ))}
+                  </div>
+                  {renderExpGrid(gridDates, pageMachines)}
                 </div>
               </div>
 
-              <div style={S.card}>
-                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 6 }}>
-                  <div style={S.h}>📋 記号マトリクス（台番号×日付）</div>
-                  <span style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                    <select value={gridEvent} onChange={(e) => setGridEvent(e.target.value)} style={{ ...S.input, fontSize: 11, padding: "4px 6px" }}>
-                      <option value="">直近30日</option>
-                      <option value={NO_EVENT_LABEL}>{NO_EVENT_LABEL}の日</option>
-                      {kv[KEYS.eventNames].map((n) => <option key={n} value={n}>{n}の日</option>)}
-                    </select>
-                    <label style={{ fontSize: 11, color: "#8b93a3" }}><input type="checkbox" checked={showPast} onChange={(e) => setShowPast(e.target.checked)} /> 過去の台も表示</label>
-                  </span>
+              {/* ---------------- 右列 ---------------- */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
+                <div style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "flex-end", marginBottom: 10 }}>
+                    {RANGE_OPTIONS.map((r) => <button key={r.key} onClick={() => { setRange(r.key); setUseCustomRange(false); }} style={chipBtn(!useCustomRange && range === r.key)}>{r.label}</button>)}
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", justifyContent: "flex-end", marginBottom: 12 }}>
+                    <span style={{ fontSize: 11, color: "#5a6272" }}>期間を指定：</span>
+                    <input type="date" value={customStart} onChange={(e) => setCustomStart(e.target.value)} style={{ ...S.input, fontSize: 11, padding: "5px 6px", borderColor: useCustomRange ? "#4fd1c5" : "#2a323f" }} />
+                    <span style={{ fontSize: 11, color: "#5a6272" }}>〜</span>
+                    <input type="date" value={customEnd} onChange={(e) => setCustomEnd(e.target.value)} style={{ ...S.input, fontSize: 11, padding: "5px 6px", borderColor: useCustomRange ? "#4fd1c5" : "#2a323f" }} />
+                    <button onClick={() => setUseCustomRange(true)} disabled={!customStart || !customEnd} style={{ fontSize: 11, padding: "5px 10px", borderRadius: 6, border: "1px solid #4fd1c5", background: useCustomRange ? "rgba(79,209,197,0.12)" : "transparent", color: "#4fd1c5", cursor: customStart && customEnd ? "pointer" : "not-allowed", opacity: customStart && customEnd ? 1 : 0.5 }}>適用</button>
+                    {useCustomRange && <button onClick={() => setUseCustomRange(false)} style={{ fontSize: 11, padding: "5px 10px", borderRadius: 6, border: "1px solid #2a323f", background: "transparent", color: "#8b93a3", cursor: "pointer" }}>解除</button>}
+                  </div>
+                  {!selected.length ? (
+                    <div style={{ height: 280, display: "flex", alignItems: "center", justifyContent: "center", color: "#5a6272", fontSize: 13, textAlign: "center" }}>下の「表示する台番」から台を選ぶと、ここにグラフが表示されます。</div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height={320}>
+                      <LineChart data={chartData} margin={{ top: 14, right: 8, left: 0, bottom: 4 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#232b37" />
+                        <XAxis dataKey="date" tick={{ fontSize: 10, fill: "#8b93a3" }} tickFormatter={(d) => md(d)} minTickGap={12} />
+                        <YAxis tick={{ fontSize: 10, fill: "#8b93a3" }} width={48} />
+                        <Tooltip contentStyle={{ background: "#1b212b", border: "1px solid #2a323f", borderRadius: 8, fontSize: 12 }} labelFormatter={(label, payload) => { const ev = payload && payload[0] && payload[0].payload ? payload[0].payload.event : ""; return ev ? `${label}（${ev}）` : label; }} />
+                        {selected.length <= 12 && <Legend wrapperStyle={{ fontSize: 10 }} />}
+                        <ReferenceLine y={0} stroke="#3a4353" />
+                        {chartMarks.closed.map((d) => { const band = getBandRange(chartData.map((x) => x.date), d); return band ? <ReferenceArea key={`closed-${d}`} x1={band.x1} x2={band.x2} fill="#5a6272" fillOpacity={0.28} stroke="none" label={{ value: "休", position: "insideTop", fill: "#c7cbd4", fontSize: 10 }} /> : null; })}
+                        {chartMarks.d2.map((d) => <ReferenceLine key={`d2-${d}`} x={d} stroke={DIGIT2_COLOR} strokeDasharray="2 2" strokeOpacity={0.55} label={{ value: "2", position: "top", fill: DIGIT2_COLOR, fontSize: 9 }} />)}
+                        {chartMarks.d7.map((d) => <ReferenceLine key={`d7-${d}`} x={d} stroke={DIGIT7_COLOR} strokeDasharray="2 2" strokeOpacity={0.55} label={{ value: "7", position: "top", fill: DIGIT7_COLOR, fontSize: 9 }} />)}
+                        {chartMarks.strong.map((x) => <ReferenceLine key={`st-${x.date}`} x={x.date} stroke="#e5484d" strokeDasharray="5 3" strokeWidth={2} label={{ value: "★", position: "top", fill: "#e5484d", fontSize: 10 }} />)}
+                        {chartMarks.semi.map((x) => <ReferenceLine key={`se-${x.date}`} x={x.date} stroke="#9ece6a" strokeDasharray="2 4" strokeOpacity={0.8} label={{ value: "🚩", position: "top", fill: "#9ece6a", fontSize: 9 }} />)}
+                        {chartMarks.ev.map((x) => <ReferenceLine key={`ev-${x.date}`} x={x.date} stroke="#f2d24b" strokeDasharray="4 3" label={{ value: "☆", position: "top", fill: "#f2d24b", fontSize: 11 }} />)}
+                        {selected.map((k, i) => { const m = machineByKey.get(k); return m ? <Line key={k} type="monotone" dataKey={k} name={machineLabel(m)} stroke={PALETTE[i % PALETTE.length]} strokeWidth={2} dot={{ r: 2 }} connectNulls isAnimationActive={false} /> : null; })}
+                      </LineChart>
+                    </ResponsiveContainer>
+                  )}
+                  <div style={{ fontSize: 11, color: "#5a6272", marginTop: 6, lineHeight: 1.6 }}>単位：枚（その日の差枚）　★(赤) = 強いイベント　☆(黄) = イベント　🚩(緑) = 準イベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日</div>
                 </div>
-                <div style={S.note}>
-                  <span style={{ color: SYMBOL_COLORS["☆"] }}>☆</span>＝読み取り上位20%＋プラス　<span style={{ color: SYMBOL_COLORS["〇"] }}>〇</span>＝上位50%＋プラス　<span style={{ color: SYMBOL_COLORS["▽"] }}>▽</span>＝上位50%だがマイナス　<span style={{ color: SYMBOL_COLORS["□"] }}>□</span>＝中間　<span style={{ color: "#8b93a3" }}>×</span>＝推定低設定（下位20%）　－＝判定不可（回転数不足）。点線の下線は個別台の代用データ。黄色い背景＝その日のイベント対象機種🎯。
-                </div>
-                {renderSymbolGrid()}
-              </div>
 
-              <div style={S.card}>
-                <div style={S.h}>🎰 設定期待度マトリクス</div>
-                <div style={S.note}>
-                  大きい数字＝期待度（0〜100、回転数が少ないほど0側に寄せる）、小さい数字＝生の読み取り。▼＝回転数が少ないのに出ている台（設定ではなく展開の可能性）。色：赤75以上／黄60／緑45／青30／灰。
-                  {[...engine.ctx.modelCtx.values()].map((c) => (
-                    <div key={c.key}>・{displayNameOf[c.key] || c.key}：{c.profile ? "確率表あり（設定判別）" : "確率表なし（店内の合算確率の順位で暫定判定）"}・G数は{c.gtype === "normal" ? "通常時（上限3900）" : c.gtype === "total" ? "総回転数（上限8000）" : "未判定（上限3900で計算）"}</div>
-                  ))}
+                <div style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ ...S.h, marginBottom: 0, display: "flex", alignItems: "center", gap: 6 }}><ListChecks size={14} />表示する台番（{selected.length}/{pageMachines.length}）</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                      <label style={{ fontSize: 11, color: "#8b93a3", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}><input type="checkbox" checked={showPast} onChange={(e) => setShowPast(e.target.checked)} />過去の台番も表示</label>
+                      <button onClick={() => setSelected(pageMachines.map((m) => m.key))} style={{ fontSize: 12, color: "#4fd1c5", background: "none", border: "1px solid #2a4a47", borderRadius: 6, padding: "4px 10px", cursor: "pointer" }}>全選択</button>
+                      <button onClick={() => setSelected([])} style={{ fontSize: 12, color: "#8b93a3", background: "none", border: "1px solid #2a323f", borderRadius: 6, padding: "4px 10px", cursor: "pointer" }}>全解除</button>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {pageMachines.map((m) => {
+                      const idx = selected.indexOf(m.key);
+                      const color = idx >= 0 ? PALETTE[idx % PALETTE.length] : "#2a323f";
+                      return <button key={m.key} className="mono" onClick={() => setSelected((sl) => (idx >= 0 ? sl.filter((x) => x !== m.key) : [...sl, m.key]))} style={{ fontSize: 12, padding: "6px 9px", borderRadius: 6, cursor: "pointer", border: `1px solid ${color}`, background: idx >= 0 ? `${color}22` : "transparent", color: idx >= 0 ? color : "#5a6272" }}>{isMultiModel ? `${m.model} ${m.no}` : m.no}</button>;
+                    })}
+                  </div>
                 </div>
-                {renderExpGrid(gridDates, pageMachines)}
-              </div>
 
-              <div style={S.card}>
-                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-                  <div style={S.h}>📈 差枚推移</div>
-                  <span style={{ display: "flex", gap: 4 }}>{[10, 30, 60, "all"].map((r) => <button key={r} onClick={() => setRange(r)} style={{ ...S.ghost, color: range === r ? "#4fd1c5" : "#8b93a3", borderColor: range === r ? "#4fd1c5" : "#2a323f" }}>{r === "all" ? "全期間" : `${r}日`}</button>)}</span>
+                <div style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={S.h}>日別データを見る</div>
+                  <input type="date" value={effViewDate} onChange={(e) => setViewDate(e.target.value)} style={{ ...S.input, marginBottom: 12, marginTop: 4 }} />
+                  {!viewDateList.length ? (
+                    <div style={{ fontSize: 12, color: "#5a6272" }}>この日のデータはまだありません。</div>
+                  ) : (
+                    <>
+                      <div className="scrollbar" style={{ maxHeight: 300, overflow: "auto", marginBottom: 14 }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                          <thead><tr><th style={S.th}>台番</th><th style={{ ...S.th, textAlign: "right" }}>差枚</th><th style={{ ...S.th, textAlign: "right" }}>G数</th><th style={{ ...S.th, textAlign: "center" }}>記号</th><th style={{ ...S.th, textAlign: "right" }}>期待度</th></tr></thead>
+                          <tbody>{viewDateList.map(({ m, r }) => (
+                            <tr key={m.key} style={{ borderTop: "1px solid #232b37" }}>
+                              <td className="mono" style={{ padding: "6px 6px", color: "#c7cbd4" }}>{isMultiModel ? machineLabel(m) : m.no}{r.src === "m" && <span style={{ color: "#bb9af7", fontSize: 10 }}> 代用</span>}</td>
+                              <td className="mono" style={{ padding: "6px 6px", textAlign: "right", fontWeight: 700, color: (r.s ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{r.s === null ? "―" : `${fmtSigned(r.s)}枚`}</td>
+                              <td className="mono" style={{ padding: "6px 6px", textAlign: "right", color: "#8b93a3" }}>{fmt(r.g)}</td>
+                              <td className="mono" style={{ padding: "6px 6px", textAlign: "center", fontWeight: 700, color: SYMBOL_COLORS[r.sym] }}>{r.sym}</td>
+                              <td className="mono" style={{ padding: "6px 6px", textAlign: "right", color: r.exp ? fiveBandColor(Math.round(r.exp.score * 100)) : "#5a6272" }}>{r.exp ? Math.round(r.exp.score * 100) : "―"}</td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
+                      <div style={{ borderTop: "1px solid #2a323f", paddingTop: 12 }}>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+                          <div style={{ ...S.h, marginBottom: 0 }}>この日までの差枚推移</div>
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>{[7, 10, 20, 30].map((w) => <button key={w} onClick={() => setViewWindow(w)} style={chipBtn(viewWindow === w)}>{w}日間</button>)}</div>
+                        </div>
+                        <div className="mini-grid">
+                          {viewWindowSeries.map((x) => <React.Fragment key={x.key}>{MiniChart({ title: isMultiModel ? machineLabel(x.m) : x.m.no, series: x.series, total: x.total, height: 100, axis: false })}</React.Fragment>)}
+                        </div>
+                      </div>
+                      <div style={{ borderTop: "1px solid #2a323f", paddingTop: 12, marginTop: 14 }}>
+                        <div style={S.h}>この日までの設定期待度マトリクス表</div>
+                        {renderExpGrid([...viewWindowDates].reverse(), viewDateList.map((x) => x.m))}
+                      </div>
+                    </>
+                  )}
                 </div>
-                <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={chartData} margin={{ top: 8, right: 10, left: 0, bottom: 4 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#232b37" />
-                    <XAxis dataKey="date" tick={{ fontSize: 10, fill: "#8b93a3" }} />
-                    <YAxis tick={{ fontSize: 10, fill: "#8b93a3" }} width={54} />
-                    <Tooltip contentStyle={{ background: "#1b212b", border: "1px solid #2a323f", fontSize: 11 }} />
-                    <Legend wrapperStyle={{ fontSize: 11 }} />
-                    <ReferenceLine y={0} stroke="#3a4353" />
-                    {selected.map((k, i) => { const m = engine.ctx.machines.get(k); return m ? <Line key={k} type="monotone" dataKey={k} name={machineLabel(m)} stroke={PALETTE[i % PALETTE.length]} dot={{ r: 1.5 }} strokeWidth={2} connectNulls /> : null; })}
-                  </LineChart>
-                </ResponsiveContainer>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 8 }}>
-                  {pageMachines.map((m) => { const on = selected.includes(m.key); return (
-                    <button key={m.key} className="mono" onClick={() => setSelected((s) => (on ? s.filter((x) => x !== m.key) : [...s, m.key]))} style={{ ...S.ghost, color: on ? "#e8b34c" : "#5a6272", borderColor: on ? "#e8b34c" : "#2a323f" }}>{machineLabel(m)}</button>
-                  ); })}
-                </div>
-              </div>
 
-              <div style={S.card}>
-                <div style={S.h}>📅 日別データ</div>
-                <select value={viewDate || engine.ctx.dates[engine.ctx.dates.length - 1]} onChange={(e) => setViewDate(e.target.value)} style={{ ...S.input, marginBottom: 8 }}>
-                  {[...engine.ctx.dates].reverse().map((d) => <option key={d} value={d}>{d}（{WD[weekdayOf(d)]}）{eventsOn(d).length ? ` ${eventsOn(d).join("、")}` : ""}</option>)}
-                </select>
-                {(() => {
-                  const d = viewDate || engine.ctx.dates[engine.ctx.dates.length - 1];
-                  const list = [...engine.ctx.machines.values()].map((m) => ({ m, r: recAt(m, d) })).filter((x) => x.r).sort((a, b) => a.m.no - b.m.no);
-                  return (
-                    <div className="scrollbar" style={{ overflowX: "auto" }}>
-                      <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
-                        <thead><tr><th style={S.th}>台</th><th style={{ ...S.th, textAlign: "right" }}>差枚</th><th style={{ ...S.th, textAlign: "right" }}>G数</th><th style={{ ...S.th, textAlign: "right" }}>BB</th><th style={{ ...S.th, textAlign: "right" }}>RB</th><th style={{ ...S.th, textAlign: "center" }}>記号</th><th style={{ ...S.th, textAlign: "right" }}>期待度</th></tr></thead>
-                        <tbody>{list.map(({ m, r }) => (
-                          <tr key={m.key}>
-                            <td className="mono" style={S.td}>{machineLabel(m)}{r.src === "m" && <span style={{ color: "#bb9af7", fontSize: 10 }}> 代用</span>}</td>
-                            <td className="mono" style={{ ...S.td, textAlign: "right", color: (r.s ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(r.s)}</td>
-                            <td className="mono" style={{ ...S.td, textAlign: "right" }}>{fmt(r.g)}</td>
-                            <td className="mono" style={{ ...S.td, textAlign: "right" }}>{r.bb ?? "―"}</td>
-                            <td className="mono" style={{ ...S.td, textAlign: "right" }}>{r.rb ?? "―"}</td>
-                            <td className="mono" style={{ ...S.td, textAlign: "center", color: SYMBOL_COLORS[r.sym], fontWeight: 700 }}>{r.sym}</td>
-                            <td className="mono" style={{ ...S.td, textAlign: "right", color: r.exp ? fiveBandColor(Math.round(r.exp.score * 100)) : "#5a6272" }}>{r.exp ? Math.round(r.exp.score * 100) : "―"}</td>
+                {machineSummaries.length > 0 && (
+                  <div style={{ ...S.card, marginBottom: 0 }}>
+                    <div style={{ ...S.h, marginBottom: 12 }}>台別チャート（{useCustomRange ? "指定期間" : (RANGE_OPTIONS.find((r) => r.key === range) || {}).label}・累計差枚）</div>
+                    <div className="mini-grid wide">
+                      {machineSummaries.map((x) => <React.Fragment key={x.key}>{MiniChart({ title: isMultiModel ? machineLabel(x.m) : x.m.no, series: x.series, total: x.count ? x.total : null, height: 130, axis: true, marks: { closed: chartMarks.closed, d2: chartMarks.d2, d7: chartMarks.d7, strong: chartMarks.strong } })}</React.Fragment>)}
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={S.h}>〇のつく日 平均差枚</div>
+                  <div style={S.note}>数字を選ぶと、その数字で終わる日付（例：2 なら 2日・12日・22日）の平均差枚を台ごとに計算します（このページの全期間データが対象）。</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+                    {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((d) => (
+                      <button key={d} onClick={() => setLuckyDigit(d === luckyDigit ? null : d)} className="mono" style={{ width: 34, height: 34, borderRadius: 8, cursor: "pointer", border: `1px solid ${luckyDigit === d ? "#e8b34c" : "#2a323f"}`, background: luckyDigit === d ? "rgba(232,179,76,0.15)" : "transparent", color: luckyDigit === d ? "#e8b34c" : "#c7cbd4", fontSize: 13, fontWeight: 700 }}>{d}</button>
+                    ))}
+                  </div>
+                  {luckyDigit === null ? <div style={{ fontSize: 12, color: "#5a6272" }}>上の数字を選んでください。</div>
+                    : !luckyDay.stats.length ? <div style={{ fontSize: 12, color: "#5a6272" }}>該当する日付のデータがまだありません。</div> : (
+                    <>
+                      <div style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: 8, padding: "10px 12px", marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 12, color: "#8b93a3" }}>全体合計差枚の平均（{luckyDay.dayCount}日分）</span>
+                        <span className="mono" style={{ fontSize: 16, fontWeight: 800, color: luckyDay.avgTotal >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(luckyDay.avgTotal)}枚</span>
+                      </div>
+                      <div className="scrollbar" style={{ maxHeight: 260, overflowY: "auto" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                          <thead><tr><th style={S.th}>台番</th><th style={{ ...S.th, textAlign: "right" }}>平均差枚</th><th style={{ ...S.th, textAlign: "right" }}>該当日数</th></tr></thead>
+                          <tbody>{luckyDay.stats.map((x) => (
+                            <tr key={x.key} style={{ borderTop: "1px solid #232b37" }}>
+                              <td className="mono" style={{ padding: "6px 6px", color: "#c7cbd4" }}>{isMultiModel ? machineLabel(x.m) : x.m.no}</td>
+                              <td className="mono" style={{ padding: "6px 6px", textAlign: "right", fontWeight: 700, color: x.avg >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(x.avg)}枚</td>
+                              <td className="mono" style={{ padding: "6px 6px", textAlign: "right", color: "#5a6272" }}>{x.count}日</td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                  <div style={{ ...S.card, marginBottom: 0 }}>
+                    <div style={{ ...S.h, fontSize: 14 }}>{pickTitle}</div>
+                    <div style={S.note}>
+                      {engine.pick.lastDate}までのデータで予想。過去の「パターンに当てはまった台の翌日☆〇率 − 全体の☆〇率（基準{engine.learned.base !== null ? `${(engine.learned.base * 100).toFixed(1)}%` : "―"}）」を点数にして合計しています。学習済みパターン{engine.learned.weights.size}件（データ{engine.ctx.dates.length}日・サンプル数15未満のパターンは使いません）。
+                      グレード：S≥60 / A≥30 / B≥10 / C≥-10 / D≥-30 / E。
+                    </div>
+                    {engine.learned.weights.size === 0 && <div style={{ fontSize: 12, color: "#e8b34c", marginBottom: 10 }}>データ蓄積中です。サンプル数がそろったパターンから順に点数が付きます（それまでは全台0pt）。</div>}
+                    <div className="scrollbar" style={{ maxHeight: 560, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+                      {engine.pick.list.map((p) => {
+                        const m = engine.ctx.machines.get(p.key);
+                        const open = expandedPick[p.key];
+                        const items = open ? p.items : p.items.slice(0, 5);
+                        return (
+                          <div key={p.key} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: 8, padding: "9px 11px" }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                              <span className="mono" style={{ width: 22, height: 22, lineHeight: "22px", textAlign: "center", borderRadius: "50%", fontWeight: 800, color: "#12161d", background: GRADE_COLORS[p.grade] }}>{p.grade}</span>
+                              <span className="mono" style={{ fontWeight: 700, color: "#e8b34c" }}>{machineLabel(m)}</span>
+                              {p.targetEvents && p.targetEvents.length > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: "#12161d", background: "#e8b34c", borderRadius: 999, padding: "1px 8px" }}>🎯 {p.targetEvents.join("、")}の対象</span>}
+                              <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: p.points >= 0 ? "#9ece6a" : "#e5697a" }}>{p.points >= 0 ? "+" : ""}{p.points.toFixed(1)}pt</span>
+                              <span style={{ fontSize: 11, color: "#5a6272" }}>前日 <span style={{ color: SYMBOL_COLORS[p.lastSym], fontWeight: 700 }}>{p.lastSym}</span>{p.lastExp && <> ・期待度 <span style={{ color: fiveBandColor(Math.round(p.lastExp.score * 100)) }}>{Math.round(p.lastExp.score * 100)}</span></>}</span>
+                            </div>
+                            {items.length > 0 && (
+                              <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 1 }}>
+                                {items.map((it) => (
+                                  <div key={it.key} className="mono" style={{ fontSize: 11, display: "flex", justifyContent: "space-between", gap: 8, color: "#8b93a3" }}>
+                                    <span>{it.label}<span style={{ color: "#5a6272" }}>：翌日☆〇 {(it.rate * 100).toFixed(1)}%（n={it.n}）</span></span>
+                                    <span style={{ color: it.points >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700, whiteSpace: "nowrap" }}>{it.points >= 0 ? "+" : ""}{it.points.toFixed(1)}</span>
+                                  </div>
+                                ))}
+                                {p.items.length > 5 && <button style={{ ...S.ghost, alignSelf: "flex-start", marginTop: 4, padding: "2px 8px" }} onClick={() => setExpandedPick((s) => ({ ...s, [p.key]: !open }))}>{open ? "閉じる" : `残り${p.items.length - 5}件を見る`}</button>}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                <div style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={S.h}>台同士の相関</div>
+                  <div style={S.note}>日ごとの差枚が似た動きをする台の組み合わせを探します（相関係数の絶対値が0.4以上、同時データ10日分以上のペアのみ表示）。相関は因果関係を示すものではなく、偶然による見かけ上の一致も含まれる点にご注意ください。</div>
+                  {!machineCorrelations.length ? <div style={{ fontSize: 12, color: "#5a6272" }}>目立った相関の組み合わせはまだ見つかっていません。</div> : (
+                    <div className="scrollbar" style={{ maxHeight: 300, overflowY: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                        <thead><tr><th style={S.th}>台番A</th><th style={S.th}>台番B</th><th style={{ ...S.th, textAlign: "right" }}>相関係数</th><th style={{ ...S.th, textAlign: "right" }}>同時日数</th></tr></thead>
+                        <tbody>{machineCorrelations.map((c) => (
+                          <tr key={`${c.a.key}-${c.b.key}`} style={{ borderTop: "1px solid #232b37" }}>
+                            <td className="mono" style={{ padding: "6px 6px", color: "#c7cbd4" }}>{isMultiModel ? machineLabel(c.a) : c.a.no}</td>
+                            <td className="mono" style={{ padding: "6px 6px", color: "#c7cbd4" }}>{isMultiModel ? machineLabel(c.b) : c.b.no}</td>
+                            <td className="mono" style={{ padding: "6px 6px", textAlign: "right", fontWeight: 700, color: c.r >= 0 ? "#9ece6a" : "#e5697a" }}>{c.r >= 0 ? "+" : ""}{c.r.toFixed(2)}</td>
+                            <td className="mono" style={{ padding: "6px 6px", textAlign: "right", color: "#5a6272" }}>{c.n}日</td>
                           </tr>
                         ))}</tbody>
                       </table>
                     </div>
-                  );
-                })()}
-              </div>
-
-              <Collapse title={`🧪 学習済みパターン一覧（${engine.learned.weights.size}件）`}>
-                <div style={S.note}>点数の大きい順。n＝過去に当てはまった回数。⚠️は信頼度の低い項目です。</div>
-                <div className="scrollbar" style={{ maxHeight: 360, overflowY: "auto" }}>
-                  <table style={{ borderCollapse: "collapse", fontSize: 11, width: "100%" }}>
-                    <thead><tr><th style={S.th}>パターン</th><th style={{ ...S.th, textAlign: "right" }}>n</th><th style={{ ...S.th, textAlign: "right" }}>翌日☆〇</th><th style={{ ...S.th, textAlign: "right" }}>点数</th></tr></thead>
-                    <tbody>{[...engine.learned.weights.values()].sort((a, b) => Math.abs(b.points) - Math.abs(a.points)).map((w) => (
-                      <tr key={w.key}>
-                        <td style={{ ...S.td, whiteSpace: "normal" }}>{w.label}</td>
-                        <td className="mono" style={{ ...S.td, textAlign: "right" }}>{w.n}</td>
-                        <td className="mono" style={{ ...S.td, textAlign: "right" }}>{(w.rate * 100).toFixed(1)}%</td>
-                        <td className="mono" style={{ ...S.td, textAlign: "right", color: w.points >= 0 ? "#9ece6a" : "#e5697a" }}>{w.points >= 0 ? "+" : ""}{w.points.toFixed(1)}</td>
-                      </tr>
-                    ))}</tbody>
-                  </table>
+                  )}
                 </div>
-              </Collapse>
-            </>
+
+                <div style={{ ...S.card, marginBottom: 0 }}>
+                  <div style={S.h}>総差枚しきい値分析（翌日プラスになりやすいライン）</div>
+                  <div style={S.note}>選んでいる台ごとに、直近N日間の総差枚が「いくら以上／以下」だと翌日プラスになりやすいかを、このページの全期間データから探します。</div>
+                  <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>{[10, 20, 30].map((w) => <button key={w} onClick={() => setAnalysisWindow(w)} style={chipBtn(analysisWindow === w)}>{w}日足</button>)}</div>
+                  {!thresholdAnalyses.length ? <div style={{ fontSize: 12, color: "#5a6272" }}>台を選ぶと、ここに分析結果が表示されます。</div> : (
+                    <div className="scrollbar" style={{ maxHeight: 420, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
+                      {thresholdAnalyses.map((a) => (
+                        <div key={a.key} style={{ borderTop: "1px solid #232b37", paddingTop: 10 }}>
+                          <div className="mono" style={{ fontSize: 13, fontWeight: 700, color: "#e8b34c", marginBottom: 6 }}>{machineLabel(a.m)}　<span style={{ fontSize: 10, color: "#5a6272", fontWeight: 400 }}>（有効データ {a.validDays}日分・基準勝率{Math.round(a.baseRate * 100)}%）</span></div>
+                          {renderThresholdResult(a.overall, "全日", a.nAll, 5)}
+                          {renderThresholdResult(a.digit2, "翌日が2のつく日のみ", a.n2, 3)}
+                          {renderThresholdResult(a.digit7, "翌日が7のつく日のみ", a.n7, 3)}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                  <Collapse flush title={`🧪 学習済みパターン一覧（${engine.learned.weights.size}件）`}>
+                    <div style={S.note}>点数の大きい順。n＝過去に当てはまった回数。⚠️は信頼度の低い項目です。</div>
+                    <div className="scrollbar" style={{ maxHeight: 360, overflowY: "auto" }}>
+                      <table style={{ borderCollapse: "collapse", fontSize: 11, width: "100%" }}>
+                        <thead><tr><th style={S.th}>パターン</th><th style={{ ...S.th, textAlign: "right" }}>n</th><th style={{ ...S.th, textAlign: "right" }}>翌日☆〇</th><th style={{ ...S.th, textAlign: "right" }}>点数</th></tr></thead>
+                        <tbody>{[...engine.learned.weights.values()].sort((a, b) => Math.abs(b.points) - Math.abs(a.points)).map((w) => (
+                          <tr key={w.key}>
+                            <td style={{ ...S.td, whiteSpace: "normal" }}>{w.label}</td>
+                            <td className="mono" style={{ ...S.td, textAlign: "right" }}>{w.n}</td>
+                            <td className="mono" style={{ ...S.td, textAlign: "right" }}>{(w.rate * 100).toFixed(1)}%</td>
+                            <td className="mono" style={{ ...S.td, textAlign: "right", color: w.points >= 0 ? "#9ece6a" : "#e5697a" }}>{w.points >= 0 ? "+" : ""}{w.points.toFixed(1)}</td>
+                          </tr>
+                        ))}</tbody>
+                      </table>
+                    </div>
+                  </Collapse>
+              </div>
+            </div>
           )}
         </div>
       )}
