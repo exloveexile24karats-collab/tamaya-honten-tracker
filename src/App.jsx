@@ -55,7 +55,11 @@ import { storage } from "./storage";
 //   店休日を選んだ時は、貼り付け欄と保存ボタンをグレーにして入力できないように。
 // v0.3.8: 全体データの「機種×日付マトリクス」にもイベントの複数選択を追加（選んだイベントの日だけを並べる。
 //   未選択なら直近30日）。日付の文字色でイベントの種類（赤＝強い・緑＝準・黄＝イベント）も表示。
-export const APP_VERSION = "0.3.8";
+// v0.3.9: アナスロで「G数・差枚・BB・RBが全部0」の台を「データ欠け」として扱う（数字なし＝null）。
+//   障害のあとのアナスロでは、民レポには数字がある台が全部0で出ていた（実データで108台。欠けとして扱うと
+//   民レポとのずれは1台あたり約6枚＝一致）。0のまま学習すると「差枚0・G数0」と誤学習するため。
+//   保存済みの過去データも読み込み時に同じ扱いにする。欠けた台は③個別台データで埋められる。
+export const APP_VERSION = "0.3.9";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -234,6 +238,10 @@ export function parseOverallSummary(text) {
 
 // アナスロ：機種名/台番号/G数/差枚/BB/RB/合成/BB確率/RB確率（後ろに空の列・空の行が大量にある）。
 // 「平均」行は除外。G数は機種により「通常時」か「総回転数」か違う（同じ日の民レポと比べて自動判定）。
+// アナスロで全部0（G数・差枚・BB・RB）の台＝データ欠け（障害時など）。数字なし（null）として扱う。
+// 本当に誰も打たなかった台も全部0になるが、その日は判定不可（－）で差し支えない。
+export const isBlankRow = (r) => !r.g && !r.s && !r.bb && !r.rb;
+export const blankToNull = (r) => (isBlankRow(r) ? { ...r, g: null, s: null, bb: null, rb: null } : r);
 export function parseAnaslo(text) {
   const rows = [];
   const seen = new Set();
@@ -247,7 +255,7 @@ export function parseAnaslo(text) {
     if (no === null || !cols[0]) continue;
     if (seen.has(no)) dupNos.push(no);
     seen.add(no);
-    rows.push({ m: cols[0], no, g: parseIntLoose(cols[2]), s: parseIntLoose(cols[3]), bb: parseIntLoose(cols[4]), rb: parseIntLoose(cols[5]) });
+    rows.push(blankToNull({ m: cols[0], no, g: parseIntLoose(cols[2]), s: parseIntLoose(cols[3]), bb: parseIntLoose(cols[4]), rb: parseIntLoose(cols[5]) }));
   }
   return { rows, dupNos };
 }
@@ -286,7 +294,7 @@ export function packDay(rows) {
 }
 export function unpackDay(day) {
   if (!day || !Array.isArray(day.rows)) return [];
-  return day.rows.map(([mi, no, g, s, bb, rb, src]) => ({ m: day.models[mi], no, g, s, bb, rb, src: src ? "m" : "a" }));
+  return day.rows.map(([mi, no, g, s, bb, rb, src]) => (src ? { m: day.models[mi], no, g, s, bb, rb, src: "m" } : blankToNull({ m: day.models[mi], no, g, s, bb, rb, src: "a" })));
 }
 export function fingerprintRows(rows) {
   return [...rows].sort((a, b) => a.no - b.no).map((r) => `${r.no}:${r.s}:${r.g}:${r.bb}:${r.rb}`).join("|");
@@ -1317,15 +1325,22 @@ export default function App() {
     }
     setAnaDup(null);
     const existing = rawRef.current[anaDate] ? unpackDay(rawRef.current[anaDate]) : [];
-    const anaNos = new Set(rows.map((r) => r.no));
-    const keptManual = existing.filter((r) => r.src === "m" && !anaNos.has(r.no)); // アナスロに無い台の代用データだけ残す
+    const anaNos = new Set(rows.filter((r) => r.s !== null).map((r) => r.no)); // 数字があるアナスロの台
+    const keptManual = existing.filter((r) => r.src === "m" && !anaNos.has(r.no)); // アナスロに無い・欠けている台の代用データは残す
+    const keptNos = new Set(keptManual.map((r) => r.no));
     const replaced = existing.filter((r) => r.src === "m" && anaNos.has(r.no)).length;
-    const all = [...rows.map((r) => ({ ...r, src: "a" })), ...keptManual];
+    const all = [...rows.filter((r) => !keptNos.has(r.no)).map((r) => ({ ...r, src: "a" })), ...keptManual];
+    const blanks = rows.filter((r) => r.s === null && !keptNos.has(r.no));
     setBusy(true);
     const res = await writeWeekly("raw", anaDate, packDay(all));
     setBusy(false);
     if (!res.ok) { setAnaStatus({ type: "error", msg: `保存に失敗しました：${res.error}` }); return; }
-    let msg = `${anaDate} のアナスロを保存しました（${rows.length}台${replaced ? `・個別台の代用${replaced}台を上書き` : ""}）。`;
+    let msg = `${anaDate} のアナスロを保存しました（${rows.length}台${replaced ? `・個別台の代用${replaced}台を上書き` : ""}${keptNos.size ? `・欠けている${keptNos.size}台は個別台の代用データを使用` : ""}）。`;
+    if (blanks.length) {
+      const byModel = {};
+      blanks.forEach((r) => { byModel[r.m] = (byModel[r.m] || 0) + 1; });
+      msg += `\n⚠ 数字が全部0の台が${blanks.length}台ありました（アナスロのデータ欠け）。この台は「数字なし」として保存し、学習には使いません。必要なら③個別台データで埋められます。\n　${Object.entries(byModel).sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m}（${n}台）`).join("、")}`;
+    }
     const rec = await autoReconcile(anaDate);
     if (rec) msg += reconcileSummary(rec);
     const dw = driftWarning(anaDate);
@@ -1343,11 +1358,13 @@ export default function App() {
     if (!parsed.rows.length) { setKbStatus({ type: "error", msg: "台番号の行を読み取れませんでした。" }); return; }
     if (closedSet.has(kbDate)) { setKbStatus({ type: "error", msg: `${kbDate} は店休日として登録されています。` }); return; }
     const existing = rawRef.current[kbDate] ? unpackDay(rawRef.current[kbDate]) : [];
-    const anaNos = new Set(existing.filter((r) => r.src !== "m").map((r) => r.no));
+    const anaNos = new Set(existing.filter((r) => r.src !== "m" && r.s !== null).map((r) => r.no)); // 欠けているアナスロの台は個別台で埋められる
     const newNos = new Set(parsed.rows.map((r) => r.no));
     const toAdd = parsed.rows.filter((r) => !anaNos.has(r.no));
     const skipped = parsed.rows.length - toAdd.length;
-    const kept = existing.filter((r) => !(r.src === "m" && newNos.has(r.no)));
+    const addNos = new Set(toAdd.map((r) => r.no));
+    // 同じ台番号の古い代用データと、欠けていたアナスロの行（数字なし）は、今回の個別台データに置き換える
+    const kept = existing.filter((r) => !(addNos.has(r.no) && (r.src === "m" || r.s === null)) && !(r.src === "m" && newNos.has(r.no)));
     const all = [...kept, ...toAdd.map((r) => ({ m: model, no: r.no, g: r.g, s: r.s, bb: r.bb, rb: r.rb, src: "m" }))];
     setBusy(true);
     let res = { ok: true };
@@ -2423,6 +2440,7 @@ export default function App() {
                           <span style={{ marginLeft: 6, color: ovr[d] ? "#9ece6a" : "#e5697a" }}>民レポ{ovr[d] ? "〇" : "未"}</span>
                           <span style={{ marginLeft: 6, color: rows.length - man ? "#9ece6a" : "#e5697a" }}>アナスロ{rows.length - man ? "〇" : "未"}</span>
                           {man > 0 && <span style={{ marginLeft: 6, color: "#bb9af7" }}>代用{man}台</span>}
+                          {rows.some((r) => r.src !== "m" && r.s === null) && <span style={{ marginLeft: 6, color: "#e8b34c" }}>アナスロ欠け{rows.filter((r) => r.src !== "m" && r.s === null).length}台</span>}
                           {ndBadge}
                           {driftChecks && driftChecks[d] && (driftChecks[d].level === "bad" || driftChecks[d].level === "warn") && <span style={{ marginLeft: 6, color: driftChecks[d].level === "bad" ? "#e5697a" : "#e8b34c", fontWeight: 700 }}>⚠ずれ</span>}
                         </span>
