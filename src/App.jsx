@@ -70,7 +70,17 @@ import { storage } from "./storage";
 //   「欠け」が出ていた。機種ごとに、0を含めた平均と0を除いた平均のどちらが民レポの平均差枚に近いかで判定
 //   （台がすべて0の機種は、民レポで差枚・G数があれば欠け）。民レポが無い日は稼働なしとして扱う。
 //   保存はアナスロの数字のまま（0のまま）。判定は表示・照合・エンジンの直前に毎回行う。
-export const APP_VERSION = "0.3.12";
+// v0.4.0: 10/16の全データ分析（5/1〜10/15）の結果を反映。
+//   ①全体データの一番上に「🔮 今日の見通し」：日付を選ぶと、その日のイベント・日付末尾・曜日・🎯対象機種から
+//     機種ごとの見通し（過去の勝率を日数に応じて控えめに足したもの）、そのイベントの過去の主役機種
+//     （7台以上・8割以上勝ち・平均+1000枚以上）、店の直近3日の出方（上位25%のあとは締め・下位25%のあとは返し）、
+//     新台の導入日の成績、機種ごとの直近30日の金合わせ（その機種で相関-0.25以下の時だけ）を表示。
+//     数字はすべて民レポから毎回計算（固定値なし）。
+//   ②ピックアップの学習パターンを追加（台ピックアップはそのまま。効くかは他と同じく実測で点数化）：
+//     前日 同じ機種の中で上位10%／下位10%、前日±3000枚以上、前日のG数の±2000G増減、店の直近3日（上位/下位25%）、
+//     機種の直近30日（上位/下位1/3）。バックテスト（ウォークフォワード・全ページ）では
+//     S 51.8%→51.2%・E 32.5%→32.3%（☆〇率）でほぼ変わらず＝台選びへの効き目は小さいという分析結果と一致。
+export const APP_VERSION = "0.4.0";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -687,13 +697,46 @@ export function buildSymbolContext(pageDays, opts) {
       mm.recs.push(rec);
     });
   });
+  // v0.4.0：その日の同じ機種の中での差枚の順位（0＝最下位〜1＝1位。3台以上ある時だけ）
+  const byDayModel = new Map();
+  machines.forEach((m) => m.recs.forEach((rec) => {
+    if (rec.s === null || rec.s === undefined) return;
+    const k = `${rec.di}|${m.modelKey}`;
+    if (!byDayModel.has(k)) byDayModel.set(k, []);
+    byDayModel.get(k).push(rec);
+  }));
+  byDayModel.forEach((list) => {
+    if (list.length < 3) return;
+    list.sort((a, b) => a.s - b.s);
+    list.forEach((rec, idx) => { rec.rankPct = idx / (list.length - 1); });
+  });
+  // v0.4.0：機種ごとの「直近30日の1台平均」の位置（機種の中で下位1/3＝lo・上位1/3＝hi）
+  const model30 = new Map();
+  {
+    const perModel = new Map();
+    byDayModel.forEach((list, k) => {
+      const [di, mk] = [parseInt(k, 10), k.slice(k.indexOf("|") + 1)];
+      if (!perModel.has(mk)) perModel.set(mk, new Array(dates.length).fill(null));
+      perModel.get(mk)[di] = list.reduce((a, x) => a + x.s, 0) / list.length;
+    });
+    perModel.forEach((arr, mk) => {
+      const l30 = arr.map((_, di) => {
+        const w = arr.slice(Math.max(0, di - 29), di + 1).filter((v) => v !== null);
+        return w.length >= 20 ? w.reduce((a, b) => a + b, 0) / w.length : null;
+      });
+      const sorted = l30.filter((v) => v !== null).sort((a, b) => a - b);
+      if (sorted.length < 30) return;
+      const lo = quantile(sorted, 1 / 3), hi = quantile(sorted, 2 / 3);
+      model30.set(mk, l30.map((v) => (v === null ? null : v <= lo ? "lo" : v >= hi ? "hi" : null)));
+    });
+  }
   readingsForPct.sort((a, b) => a - b);
   const p20 = quantile(readingsForPct, 0.2);
   const p50 = quantile(readingsForPct, 0.5);
   const p80 = quantile(readingsForPct, 0.8);
   // 記号（§4-2）：読み取りの階層（p20/p50/p80）× 差枚
   machines.forEach((m) => m.recs.forEach((r) => { r.sym = classifySymbol(r, { p20, p50, p80 }); }));
-  return { dates, gapBefore, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length };
+  return { dates, gapBefore, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length, model30, storeLevel: o.storeLevel || null };
 }
 export function classifySymbol(r, p) {
   if (!r.enough || r.reading === null || p.p20 === null || r.s === null || r.s === undefined) return "－";
@@ -787,6 +830,28 @@ export function patternKeysAt(ctx, m, i, target) {
       if (avg3 >= avgAll + 1000) add("rotHot", "自己平均比で好調（直近3日）");
     }
   }
+  // v0.4.0 追加（10/16の全データ分析で見つかったもの。効くかどうかは他と同じく実測で点数化）
+  const rk = r[i].rankPct;
+  if (rk !== undefined) {
+    if (rk >= 0.9) add("prevRankTop", "前日 同じ機種の中で差枚上位10%");
+    else if (rk <= 0.1) add("prevRankBottom", "前日 同じ機種の中で差枚下位10%");
+  }
+  if (r[i].s !== null && r[i].s !== undefined) {
+    if (r[i].s <= -3000) add("prevBigLose", "前日-3000枚以下（大負け）");
+    else if (r[i].s >= 3000) add("prevBigWin", "前日+3000枚以上（大勝ち）");
+  }
+  if (c1 && r[i].g !== null && r[i].g !== undefined && r[i - 1].g !== null && r[i - 1].g !== undefined) {
+    const dg = r[i].g - r[i - 1].g;
+    if (dg >= 2000) add("gUp", "前日のG数が前々日より2000G以上増加");
+    else if (dg <= -2000) add("gDown", "前日のG数が前々日より2000G以上減少");
+  }
+  const st = ctx.storeLevel ? ctx.storeLevel(d) : null;
+  if (st === "hi") add("store3hi", "店の直近3日が出ている（上位25%）");
+  else if (st === "lo") add("store3lo", "店の直近3日が出ていない（下位25%）");
+  const m30 = ctx.model30 && ctx.model30.get(m.modelKey);
+  const m30v = m30 ? m30[r[i].di] : null;
+  if (m30v === "lo") add("m30lo", "機種の直近30日が悪い（下位1/3）");
+  else if (m30v === "hi") add("m30hi", "機種の直近30日が良い（上位1/3）");
   // 曜日
   add(`wd:${weekdayOf(target)}`, `${WD[weekdayOf(target)]}曜日`);
   // 月に☆〇 → 翌日（2通りの解釈を両方実装：今月の☆〇回数／月曜の☆〇）
@@ -946,6 +1011,156 @@ export function walkForwardBacktest(pageDays, opts, closedSet, warmup = 20) {
 // =============================================================================
 // ここから画面（React）
 // =============================================================================
+// =============================================================================
+// v0.4.0：今日の見通し（10/16の全データ分析の結果をアプリに反映）
+// 数字は固定で書かず、民レポから毎回計算する（データが増えると自動で更新される）。
+// =============================================================================
+function ovrDayAvg(day) {
+  let tot = 0, n = 0;
+  (day.modelRows || []).forEach((r) => { if (r.total && r.avgSada !== null && r.avgSada !== undefined) { tot += r.avgSada * r.total; n += r.total; } });
+  return n ? tot / n : null;
+}
+// 店の「直近3日」の出方の位置。その日までのデータだけで上位25%＝hi・下位25%＝lo（後から知った数字は使わない）
+export function buildStoreLevel(ovrByDate) {
+  const dates = Object.keys(ovrByDate || {}).sort();
+  const avg = dates.map((d) => ovrDayAvg(ovrByDate[d]));
+  const level = {};
+  const l3 = {};
+  const seen = [];
+  dates.forEach((d, i) => {
+    if (i < 2 || avg[i] === null || avg[i - 1] === null || avg[i - 2] === null) return;
+    const v = (avg[i] + avg[i - 1] + avg[i - 2]) / 3;
+    l3[d] = v;
+    seen.push(v);
+    if (seen.length >= 20) {
+      const s = [...seen].sort((a, b) => a - b);
+      level[d] = v >= quantile(s, 0.75) ? "hi" : v <= quantile(s, 0.25) ? "lo" : "mid";
+    }
+  });
+  return { level, l3, fn: (d) => level[d] || null };
+}
+
+export const SHUYAKU_MIN_N = 7;
+export const SHUYAKU_MIN_RATE = 0.8;
+export const SHUYAKU_MIN_AVG = 1000;
+// 主役機種：その日ほぼ全台が勝った機種（7台以上・8割以上が勝ち・1台平均+1000枚以上）
+export function shuyakuOf(day, resolve) {
+  return (day.modelRows || []).filter((r) => !r.isVariety && r.total >= SHUYAKU_MIN_N && r.wins !== null && r.wins / r.total >= SHUYAKU_MIN_RATE && (r.avgSada ?? -1e9) >= SHUYAKU_MIN_AVG)
+    .map((r) => ({ key: resolve(r.name), name: r.name, wins: r.wins, total: r.total, avg: r.avgSada }));
+}
+
+// 見通しの本体。target＝見たい日（その日より前の民レポだけを使う）
+export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve }) {
+  const dates = Object.keys(ovr || {}).filter((d) => d < target).sort();
+  if (dates.length < 10) return null;
+  const R = resolve || ((x) => x);
+  const tEvents = eventsOn(target);
+  const tDig = parseInt(target.slice(8, 10), 10) % 10;
+  const tWd = weekdayOf(target);
+  // 機種ごとの日別データ
+  const series = new Map(); // key -> Map(date -> {wins,total,avg})
+  const names = {};
+  dates.forEach((d) => ovr[d].modelRows.forEach((r) => {
+    if (r.isVariety || !r.total || r.wins === null || r.wins === undefined) return;
+    const k = R(r.name);
+    names[k] = r.name;
+    if (!series.has(k)) series.set(k, new Map());
+    series.get(k).set(d, { wins: r.wins, total: r.total, avg: r.avgSada });
+  }));
+  // 条件（予想日に当てはまるもの）。日付末尾は、同じ日がほぼイベントで登録済みなら二重に数えない
+  const conds = [];
+  tEvents.forEach((E) => conds.push({ id: `ev:${E}`, label: `「${E}」`, match: (d) => eventsOn(d).includes(E) }));
+  if (!tEvents.length) conds.push({ id: "noev", label: "イベント無し", match: (d) => !eventsOn(d).length });
+  const digMatch = (d) => parseInt(d.slice(8, 10), 10) % 10 === tDig;
+  const digDays = dates.filter(digMatch);
+  const dupDig = conds.some((c) => c.id.startsWith("ev:") && digDays.length && digDays.filter(c.match).length / digDays.length >= 0.8);
+  if (!dupDig) conds.push({ id: "dig", label: `${tDig}のつく日`, match: digMatch });
+  conds.push({ id: "wd", label: `${WD[tWd]}曜日`, match: (d) => weekdayOf(d) === tWd });
+  const condDays = conds.map((c) => new Set(dates.filter(c.match)));
+  // 主役の履歴（予想日のイベントごと）
+  const shuyakuHistory = tEvents.map((E) => ({
+    event: E,
+    days: dates.filter((d) => eventsOn(d).includes(E)).map((d) => ({ date: d, list: shuyakuOf(ovr[d], R) })).reverse(),
+  }));
+  const shuyakuCount = {};
+  const seenShu = new Set(); // 同じ日に2つのイベント（例：メガンダイ＋8のつく日）があっても1回と数える
+  shuyakuHistory.forEach((h) => h.days.forEach((x) => x.list.forEach((s) => { const id = `${x.date}|${s.key}`; if (seenShu.has(id)) return; seenShu.add(id); shuyakuCount[s.key] = (shuyakuCount[s.key] || 0) + 1; })));
+  // 機種ごとの見通し
+  const lastDate = dates[dates.length - 1];
+  const models = [];
+  series.forEach((m, k) => {
+    const latest = m.get(lastDate);
+    if (!latest || latest.total < 3) return; // 今も置いてあり3台以上の機種
+    let W = 0, T = 0;
+    m.forEach((x) => { W += x.wins; T += x.total; });
+    if (m.size < 15 || !T) return;
+    const base = W / T;
+    const parts = [];
+    let est = base;
+    conds.forEach((c, ci) => {
+      let w = 0, t = 0, nd = 0;
+      condDays[ci].forEach((d) => { const x = m.get(d); if (x) { w += x.wins; t += x.total; nd += 1; } });
+      if (nd < 3 || !t) return;
+      const rate = w / t;
+      const weight = nd / (nd + 8); // 日数が少ないほど控えめに
+      est += weight * (rate - base);
+      parts.push({ label: c.label, rate, days: nd, diff: rate - base });
+    });
+    // イベント対象機種（3*3など）：過去に対象だった日の成績
+    const isTarget = isTargetOn ? isTargetOn(target, k) : false;
+    let targetPart = null;
+    if (isTarget) {
+      let w = 0, t = 0, nd = 0;
+      m.forEach((x, d) => { if (isTargetOn(d, k)) { w += x.wins; t += x.total; nd += 1; } });
+      if (nd >= 2 && t) { targetPart = { rate: w / t, days: nd, diff: w / t - base }; est += (nd / (nd + 8)) * (w / t - base); }
+    }
+    // 直近30日の金合わせ（その機種で効いている時だけ表示）
+    const ds = [...m.keys()].sort();
+    const avgs = ds.map((d) => m.get(d).avg);
+    const l30 = ds.map((_, i) => { const w = avgs.slice(Math.max(0, i - 30), i).filter((v) => v !== null); return w.length >= 20 ? w.reduce((a, b) => a + b, 0) / w.length : null; });
+    const expOf = (d) => { // その日のイベントから見た「いつもの」平均（同じイベントの日の平均、無ければイベント無しの日の平均）
+      const ev = eventsOn(d);
+      const same = ds.filter((x) => x !== d && (ev.length ? eventsOn(x).some((e) => ev.includes(e)) : !eventsOn(x).length)).map((x) => m.get(x).avg).filter((v) => v !== null);
+      return same.length >= 3 ? same.reduce((a, b) => a + b, 0) / same.length : null;
+    };
+    const xs = [], ys = [];
+    ds.forEach((d, i) => { const e = l30[i] !== null && avgs[i] !== null ? expOf(d) : null; if (e !== null) { xs.push(l30[i]); ys.push(avgs[i] - e); } });
+    let balance = null;
+    if (xs.length >= 60) {
+      const r = pearsonCorrelation(xs, ys);
+      const all = avgs.slice(-30).filter((v) => v !== null);
+      const cur = all.length >= 20 ? all.reduce((a, b) => a + b, 0) / all.length : null;
+      if (r !== null && r <= -0.25 && cur !== null) {
+        const sorted = [...xs].sort((a, b) => a - b);
+        const pos = cur <= quantile(sorted, 1 / 3) ? "lo" : cur >= quantile(sorted, 2 / 3) ? "hi" : "mid";
+        balance = { r, cur, pos, n: xs.length };
+      }
+    }
+    models.push({ key: k, name: names[k], total: latest.total, base, est: Math.max(0.02, Math.min(0.98, est)), parts, isTarget, targetPart, shuyaku: shuyakuCount[k] || 0, balance });
+  });
+  models.sort((a, b) => b.est - a.est);
+  // 店の直近3日
+  const sl = buildStoreLevel(Object.fromEntries(dates.map((d) => [d, ovr[d]])));
+  const l3dates = Object.keys(sl.l3).sort();
+  const nextOf = {}; dates.forEach((d, i) => { if (i + 1 < dates.length) nextOf[d] = dates[i + 1]; });
+  const grp = { hi: [], lo: [], mid: [] };
+  l3dates.forEach((d) => { const lv = sl.level[d]; const nx = nextOf[d]; if (lv && nx) { const a = ovrDayAvg(ovr[nx]); if (a !== null) grp[lv].push(a); } });
+  const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+  const store = { level: sl.level[lastDate] || null, l3: sl.l3[lastDate] ?? null, nextHi: mean(grp.hi), nextLo: mean(grp.lo), nextMid: mean(grp.mid), nHi: grp.hi.length, nLo: grp.lo.length };
+  // 新台の導入日（民レポで初めて出た日。最初の日は除く）
+  const firstSeen = {};
+  dates.forEach((d) => ovr[d].modelRows.forEach((r) => { if (!r.isVariety && r.total >= 3) { const k = R(r.name); if (!firstSeen[k]) firstSeen[k] = { d, r }; } }));
+  let nw = 0, nt = 0, ns = 0, nn = 0, nDay2w = 0, nDay2t = 0;
+  Object.values(firstSeen).forEach(({ d, r }) => {
+    if (d === dates[0]) return;
+    nw += r.wins || 0; nt += r.total; ns += r.avgSada || 0; nn += 1;
+    const i = dates.indexOf(d);
+    if (i + 1 < dates.length) { const r2 = ovr[dates[i + 1]].modelRows.find((x) => R(x.name) === R(r.name)); if (r2 && r2.total) { nDay2w += r2.wins || 0; nDay2t += r2.total; } }
+  });
+  const newMachine = nn >= 3 ? { models: nn, rate: nt ? nw / nt : null, avg: ns / nn, nextRate: nDay2t ? nDay2w / nDay2t : null } : null;
+  return { target, lastDate, events: tEvents, conds: conds.map((c, i) => ({ label: c.label, days: condDays[i].size })), models, shuyakuHistory, store, newMachine };
+}
+
 const EVENT_DELIMITER = "、";
 export function splitNames(s) {
   return String(s || "").split(EVENT_DELIMITER).map((x) => x.trim()).filter(Boolean);
@@ -1227,6 +1442,7 @@ export default function App() {
     rows: classifyBlankRows(unpackDay(raw[date]).map((r) => ({ ...r, em: effectiveModelName(r, noModel) })), ovr[date], resolve),
   })), [rawDates, raw, noModel, ovr, resolve]);
   const gtypeOf = useCallback((mk) => gtypeOfEntry(gtypes[mk]), [gtypes]);
+  const storeLevelFn = useMemo(() => buildStoreLevel(ovr).fn, [ovr]);
   const profileByKey = useMemo(() => {
     const m = {};
     Object.keys(SETTING_PROFILES).forEach((n) => { m[resolve(n)] = SETTING_PROFILES[n]; });
@@ -1860,11 +2076,11 @@ export default function App() {
   }, [viewMode, currentPage, pageNameKeys, allDays, resolve, displayNameOf]);
   const engine = useMemo(() => {
     if (!pageDays.length) return null;
-    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet, closedSet });
+    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet, closedSet, storeLevel: storeLevelFn });
     const learned = learnSymbolPatternWeights(ctx);
     const pick = scoreSymbolPickupToday(ctx, learned, closedSet, skipTargetSet);
     return { ctx, learned, pick };
-  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet]);
+  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet, storeLevelFn]);
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
   const machineLabel = (m) => (isMultiModel ? `${m.model} ${m.no}番` : `${m.no}番`);
 
@@ -2103,6 +2319,15 @@ export default function App() {
       return names.some((n) => ovrGridEventFilter.includes(n));
     }).reverse();
   }, [ovrDates, ovrGridEventFilter, eventsOn]);
+  // ---- 今日の見通し（v0.4.0）----
+  const [outlookDate, setOutlookDate] = useState("");
+  const defaultOutlookDate = useMemo(() => (ovrDates.length ? nextOpenDate(ovrDates[ovrDates.length - 1], closedSet, noDataSet) : todayStr()), [ovrDates, closedSet, noDataSet]);
+  const effOutlookDate = outlookDate || defaultOutlookDate;
+  const [outlookAll, setOutlookAll] = useState(false);
+  const outlook = useMemo(() => {
+    if (viewMode !== "overall" || !effOutlookDate) return null;
+    try { return buildOutlook({ ovr, target: effOutlookDate, eventsOn, isTargetOn, resolve }); } catch (e) { return null; }
+  }, [viewMode, ovr, effOutlookDate, eventsOn, isTargetOn, resolve]);
   // ---- イベントを選んで過去を見る（v0.2.2）----
   const [evHist, setEvHist] = useState("");
   const allEventNames = useMemo(() => {
@@ -2634,6 +2859,71 @@ export default function App() {
             <div style={S.card}>
               <div style={S.h}>まだデータがありません</div>
               <div style={S.note}>「🔧 共通設定」で暗証番号を解除し、民レポとアナスロを貼り付けてください。機種ごとのページは「ページ追加」で作り、正式名称（機種名）を登録すると自動でデータが入ります。</div>
+            </div>
+          )}
+          {ovrDates.length >= 10 && (
+            <div style={S.card}>
+              <div style={S.h}>🔮 今日の見通し（機種が強くなる日・弱くなる日）</div>
+              <div style={S.note}>10/16の全データ分析で、本店は「どの台か」より「どの日にどの機種か」で結果が決まると分かったため、その日の条件から機種ごとの見通しを出します。数字は民レポの過去データから毎回計算します（データが増えると自動で更新）。台ごとのピックアップは各機種ページにそのまま残っています。</div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
+                <input type="date" value={effOutlookDate} onChange={(e) => setOutlookDate(e.target.value)} style={{ ...S.input, width: 170 }} />
+                {outlookDate && <button onClick={() => setOutlookDate("")} style={chipBtn(false)}>次の営業日に戻す</button>}
+                <span style={{ fontSize: 12, color: "#c7cbd4" }}>（{WD[weekdayOf(effOutlookDate)]}）{eventsOn(effOutlookDate).length ? <span style={{ color: isStrong(effOutlookDate) ? "#e5484d" : "#f2d24b" }}>{eventsOn(effOutlookDate).join("、")}</span> : <span style={{ color: "#5a6272" }}>イベント未登録</span>}</span>
+              </div>
+              {closedSet.has(effOutlookDate) && <div style={{ fontSize: 12, color: "#e5697a", marginBottom: 8 }}>この日は店休日です。</div>}
+              {!eventsOn(effOutlookDate).length && <div style={{ fontSize: 11, color: "#8b93a3", marginBottom: 8 }}>※イベントがある日は、先に「共通設定」でその日のイベント（と対象機種）を登録すると見通しに反映されます。</div>}
+              {!outlook ? <div style={{ fontSize: 12, color: "#5a6272" }}>民レポが10日分以上たまると表示されます。</div> : (
+                <>
+                  {outlook.store.level && (
+                    <div style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: 6, padding: "8px 10px", marginBottom: 8, fontSize: 12, lineHeight: 1.6 }}>
+                      <b>🏪 店の直近3日（〜{md(outlook.lastDate)}）</b>：1台平均 <span className="mono" style={{ color: (outlook.store.l3 ?? 0) >= 0 ? "#9ece6a" : "#e5697a" }}>{fmtSigned(outlook.store.l3)}</span>
+                      {outlook.store.level === "hi" && <span style={{ color: "#e5697a" }}>　出ている（上位25%）→ 締めやすい</span>}
+                      {outlook.store.level === "lo" && <span style={{ color: "#9ece6a" }}>　出ていない（下位25%）→ 返しやすい</span>}
+                      {outlook.store.level === "mid" && <span style={{ color: "#8b93a3" }}>　普通</span>}
+                      <div style={{ fontSize: 11, color: "#8b93a3" }}>過去の翌日の店平均：上位25%のあと <span className="mono">{fmtSigned(outlook.store.nextHi)}</span>（{outlook.store.nHi}回）／下位25%のあと <span className="mono">{fmtSigned(outlook.store.nextLo)}</span>（{outlook.store.nLo}回）</div>
+                    </div>
+                  )}
+                  {outlook.newMachine && outlook.events.some((e) => e.includes("新台")) && (
+                    <div style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: 6, padding: "8px 10px", marginBottom: 8, fontSize: 12, lineHeight: 1.6 }}>
+                      <b>🆕 新台の導入日</b>：過去{outlook.newMachine.models}機種の導入日は勝率 <b>{Math.round(outlook.newMachine.rate * 100)}%</b>・平均 <span className="mono">{fmtSigned(outlook.newMachine.avg)}</span>。翌日は勝率{outlook.newMachine.nextRate !== null ? Math.round(outlook.newMachine.nextRate * 100) : "―"}%に下がります（強いのは導入日だけ）。
+                    </div>
+                  )}
+                  {outlook.shuyakuHistory.map((h) => (
+                    <div key={h.event} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: 6, padding: "8px 10px", marginBottom: 8, fontSize: 12, lineHeight: 1.6 }}>
+                      <b>👑 「{h.event}」の過去の主役機種</b><span style={{ fontSize: 11, color: "#8b93a3" }}>（{SHUYAKU_MIN_N}台以上・8割以上が勝ち・平均+{SHUYAKU_MIN_AVG}枚以上）</span>
+                      {h.days.length === 0 ? <div style={{ color: "#5a6272" }}>このイベントの過去の民レポはまだありません。</div> : h.days.slice(0, 8).map((x) => (
+                        <div key={x.date} className="mono" style={{ fontSize: 11 }}>
+                          <span style={{ color: "#8b93a3" }}>{md(x.date)}</span>　{x.list.length ? x.list.map((s) => <span key={s.key} style={{ marginRight: 8, color: "#f2d24b" }}>{s.name} {s.wins}/{s.total}台 {fmtSigned(s.avg)}</span>) : <span style={{ color: "#5a6272" }}>主役なし</span>}
+                        </div>
+                      ))}
+                      {h.days.length > 8 && <div style={{ fontSize: 11, color: "#5a6272" }}>ほか{h.days.length - 8}回（主役あり{h.days.slice(8).filter((x) => x.list.length).length}回）</div>}
+                    </div>
+                  ))}
+                  <div style={{ fontSize: 11, color: "#8b93a3", margin: "4px 0 6px" }}>見通し＝その機種のいつもの勝率に、今日の条件（{outlook.conds.map((c) => `${c.label}${c.days}日`).join("・")}{" "}／🎯対象）で過去どうだったかを日数に応じて足したもの。勝率＝差枚プラスの台の割合。</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {(outlookAll ? outlook.models : outlook.models.slice(0, 12)).map((m) => {
+                      const d = m.est - m.base;
+                      return (
+                        <div key={m.key} style={{ background: "#12161d", border: `1px solid ${d >= 0.08 ? "#4a5a2a" : d <= -0.08 ? "#5a2a33" : "#232b37"}`, borderRadius: 6, padding: "7px 9px" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
+                            <span>{m.isTarget && <span style={{ color: "#e8b34c" }}>🎯</span>}{m.shuyaku > 0 && <span style={{ color: "#f2d24b" }}>👑{m.shuyaku}</span>} {m.name}<span style={{ color: "#5a6272" }}>（{m.total}台）</span></span>
+                            <span className="mono">見通し <b style={{ color: d >= 0.05 ? "#9ece6a" : d <= -0.05 ? "#e5697a" : "#c7cbd4" }}>{Math.round(m.est * 100)}%</b><span style={{ color: "#5a6272" }}>　いつも{Math.round(m.base * 100)}%</span></span>
+                          </div>
+                          <div style={{ fontSize: 11, color: "#8b93a3", marginTop: 3, lineHeight: 1.7 }}>
+                            {m.parts.map((p) => <span key={p.label} style={{ marginRight: 8, display: "inline-block", color: p.diff >= 0.05 ? "#9ece6a" : p.diff <= -0.05 ? "#e5697a" : "#8b93a3" }}>{p.label} {Math.round(p.rate * 100)}%（{p.days}日）</span>)}
+                            {m.targetPart && <span style={{ marginRight: 8, display: "inline-block", color: "#e8b34c" }}>🎯対象の日 {Math.round(m.targetPart.rate * 100)}%（{m.targetPart.days}日）</span>}
+                            {m.balance && m.balance.pos !== "mid" && <span style={{ display: "inline-block", color: m.balance.pos === "lo" ? "#9ece6a" : "#e5697a" }}>⚖️直近30日が{m.balance.pos === "lo" ? "悪い→戻りやすい" : "良い→締めやすい"}（この機種で相関{m.balance.r.toFixed(2)}）</span>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {outlook.models.length > 12 && <button onClick={() => setOutlookAll((v) => !v)} style={{ ...chipBtn(false), marginTop: 8 }}>{outlookAll ? "上位12機種だけ表示" : `全${outlook.models.length}機種を表示`}</button>}
+                  <div style={{ fontSize: 11, color: "#5a6272", marginTop: 8, lineHeight: 1.6 }}>
+                    10/16の分析で分かっていること：台番号・台の位置・据え置きには法則が見つからない（576通り調べて偶然と同じ）／前日に同じ機種で上位だった台はわずかに下がり、大負けした台はわずかに上がる（1〜3%）。これらは各機種ページのピックアップの学習パターンに入っています。
+                  </div>
+                </>
+              )}
             </div>
           )}
           {dailyTotals.length > 0 && (
