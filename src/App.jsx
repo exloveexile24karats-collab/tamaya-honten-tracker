@@ -53,7 +53,9 @@ import { storage } from "./storage";
 // v0.3.7: 保存したあと、入力欄の日付を「次の日（店休日は飛ばす）」に進めるように（古い順に入力しやすく）。
 //   民レポ・アナスロ・個別台すべて。民レポの日付の下にも登録済みかどうかを表示。
 //   店休日を選んだ時は、貼り付け欄と保存ボタンをグレーにして入力できないように。
-export const APP_VERSION = "0.3.7";
+// v0.3.8: 全体データの「機種×日付マトリクス」にもイベントの複数選択を追加（選んだイベントの日だけを並べる。
+//   未選択なら直近30日）。日付の文字色でイベントの種類（赤＝強い・緑＝準・黄＝イベント）も表示。
+export const APP_VERSION = "0.3.8";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -2009,7 +2011,15 @@ export default function App() {
     const marks = s.modelRows.map((r) => ({ name: r.name, mark: classifyMinRepoMark(r) })).filter((x) => x.mark);
     return { date: d, total: n ? tot : null, avg: n ? tot / n : null, avgG: n ? g / n : null, n, marks };
   }), [ovrDates, ovr]);
-  const ovrGridDates = useMemo(() => [...ovrDates].slice(-30).reverse(), [ovrDates]);
+  const [ovrGridEventFilter, setOvrGridEventFilter] = useState([]);
+  const ovrGridDates = useMemo(() => {
+    if (!ovrGridEventFilter.length) return [...ovrDates].slice(-30).reverse();
+    return ovrDates.filter((d) => {
+      const names = eventsOn(d);
+      if (!names.length) return ovrGridEventFilter.includes(NO_EVENT_LABEL);
+      return names.some((n) => ovrGridEventFilter.includes(n));
+    }).reverse();
+  }, [ovrDates, ovrGridEventFilter, eventsOn]);
   // ---- イベントを選んで過去を見る（v0.2.2）----
   const [evHist, setEvHist] = useState("");
   const allEventNames = useMemo(() => {
@@ -2071,14 +2081,14 @@ export default function App() {
   })() : "ピックアップ（実測パターン方式）";
 
   // ---- 機種ページの部品（プラザ2と同じ見た目）----
-  const toggleEventFilter = (name) => setGridEventFilter((l) => (l.includes(name) ? l.filter((n) => n !== name) : [...l, name]));
-  const renderEventMultiSelect = () => (
+  // イベントの複数選択（機種ページのマトリクス表と全体データのマトリクスで共通）
+  const renderEventMultiSelect = (selectedList = gridEventFilter, setList = setGridEventFilter) => (
     <div className="scrollbar" style={{ maxHeight: 120, overflowY: "auto", display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10, padding: 8, background: "#12161d", border: "1px solid #2a323f", borderRadius: 6 }}>
       {[NO_EVENT_LABEL, ...allEventNames].map((n) => {
-        const active = gridEventFilter.includes(n);
+        const active = selectedList.includes(n);
         const noEv = n === NO_EVENT_LABEL;
         return (
-          <button key={n} onClick={() => toggleEventFilter(n)} style={{
+          <button key={n} onClick={() => setList((l) => (l.includes(n) ? l.filter((x) => x !== n) : [...l, n]))} style={{
             fontSize: 11, padding: "4px 9px", borderRadius: 999, cursor: "pointer",
             border: active ? `1px solid ${noEv ? "#8b93a3" : "#7aa2f7"}` : noEv ? "1px dashed #3a4353" : "1px solid #2a323f",
             background: active ? (noEv ? "rgba(139,147,163,0.15)" : "rgba(122,162,247,0.15)") : "transparent",
@@ -2630,11 +2640,13 @@ export default function App() {
             </div>
           )}
           {ovrGridDates.length > 0 && (
-            <Collapse title="📋 機種×日付マトリクス（☆◎◯▲、直近30日）" defaultOpen>
-              <div style={S.note}>台数の多い順。青い枠はその日バラエティ（1台設置）だったセル、黄色い背景はイベント対象機種🎯です。</div>
+            <Collapse title={`📋 機種×日付マトリクス（☆◎◯▲、${ovrGridEventFilter.length ? `選んだイベントの日・${ovrGridDates.length}日` : "直近30日"}）`} defaultOpen>
+              <div style={S.note}>台数の多い順。イベントを選ぶと、そのイベントがあった日付だけを並べます（複数選択可。何も選ばない時は直近30日）。青い枠はその日バラエティ（1台設置）だったセル、黄色い背景はイベント対象機種🎯です。日付の色：赤＝強いイベント・緑＝準イベント・黄＝イベント。</div>
+              {renderEventMultiSelect(ovrGridEventFilter, setOvrGridEventFilter)}
+              {!ovrGridDates.length && <div style={{ fontSize: 12, color: "#5a6272", marginBottom: 6 }}>選んだイベントの日の民レポはまだありません。</div>}
               <div className="scrollbar" style={{ overflowX: "auto" }}>
                 <table style={{ borderCollapse: "collapse", fontSize: 11 }}>
-                  <thead><tr><th style={{ ...S.th, position: "sticky", left: 0, background: "#1b212b" }} />{ovrGridDates.map((d) => <th key={d} className="mono" style={{ ...S.th, fontSize: 9 }}>{d.slice(5)}</th>)}</tr></thead>
+                  <thead><tr><th style={{ ...S.th, position: "sticky", left: 0, background: "#1b212b" }} />{ovrGridDates.map((d) => <th key={d} className="mono" title={eventsOn(d).join("、")} style={{ ...S.th, fontSize: 9, color: isStrong(d) ? "#e5484d" : isSemi(d) ? "#9ece6a" : eventsOn(d).length ? "#f2d24b" : "#5a6272" }}>{d.slice(5)}</th>)}</tr></thead>
                   <tbody>{ovrGridRows.map((k) => (
                     <tr key={k}>
                       <td title={displayNameOf[k] || k} style={{ ...S.td, position: "sticky", left: 0, background: "#1b212b", maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", color: "#c7cbd4" }}>{displayNameOf[k] || k}</td>
