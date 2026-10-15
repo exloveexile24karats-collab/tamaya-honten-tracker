@@ -47,7 +47,13 @@ import { storage } from "./storage";
 // v0.3.5: 「データなしの日」（営業していたがデータが取れない日。例：10/6〜10/8のサイト障害）を登録できるように。
 //   店休日とは別扱い：データなしの日をまたぐ「前日→翌日」の組み合わせは学習に使わず、連続（×2連続など）も
 //   つなげない。予想日はデータなしの日も飛ばす。グラフには灰色の帯「なし」。キー slot-no-data-days-v1。
-export const APP_VERSION = "0.3.5";
+// v0.3.6: 「前日→翌日」としてつなげるのは、間の日がすべて店休日の時だけにした（データなし・民レポだけの日・
+//   入れ忘れの日をまたがない）。予想日は店休日・データなし・すでに民レポがある日を飛ばす。
+//   データなしの印は民レポだけある日にも付けられ、アナスロ（または個別台）を保存した時だけ自動で外れる。
+// v0.3.7: 保存したあと、入力欄の日付を「次の日（店休日は飛ばす）」に進めるように（古い順に入力しやすく）。
+//   民レポ・アナスロ・個別台すべて。民レポの日付の下にも登録済みかどうかを表示。
+//   店休日を選んだ時は、貼り付け欄と保存ボタンをグレーにして入力できないように。
+export const APP_VERSION = "0.3.7";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -584,8 +590,14 @@ export function buildSymbolContext(pageDays, opts) {
   const isSemi = o.isSemi || (() => false);
   const targetsOn = o.targetsOn || (() => new Map()); // date -> Map(イベント名 -> Set(機種キー))
   const dates = pageDays.map((d) => d.date);
-  // gapBefore[di]：dates[di-1] と dates[di] の間にデータなしの日がある（前日→翌日としてつなげない）
-  const gapBefore = dates.map((d, i) => i > 0 && hasNoDataBetween(dates[i - 1], d, o.noDataSet));
+  // gapBefore[di]：dates[di-1] と dates[di] の間に「店休日ではない日」がある（＝データが無い営業日。前日→翌日としてつなげない）
+  // closedSet を渡さない時（テスト・古い呼び出し）は、データなしの日だけを見る
+  const gapBefore = dates.map((d, i) => {
+    if (i === 0) return false;
+    if (!o.closedSet) return hasNoDataBetween(dates[i - 1], d, o.noDataSet);
+    for (let x = addDays(dates[i - 1], 1); x < d; x = addDays(x, 1)) if (!o.closedSet.has(x)) return true;
+    return false;
+  });
   const modelCtx = new Map();
   const getModelCtx = (mk) => {
     if (!modelCtx.has(mk)) {
@@ -1141,6 +1153,8 @@ export default function App() {
   const dateEvent = kv[KEYS.dateEvent];
   const closedSet = useMemo(() => new Set(kv[KEYS.closed].map((c) => c.date)), [kv]);
   const noDataSet = useMemo(() => new Set((kv[KEYS.noData] || []).map((c) => c.date)), [kv]);
+  // 予想日を決める時に飛ばす日（データなし＋すでに民レポがある＝終わった日）
+  const skipTargetSet = useMemo(() => new Set([...noDataSet, ...Object.keys(ovr)]), [noDataSet, ovr]);
   const strongNames = useMemo(() => new Set(kv[KEYS.strong].map((s) => s.name)), [kv]);
   const semiNames = useMemo(() => new Set(kv[KEYS.semi].map((s) => s.name)), [kv]);
   const resolve = useMemo(() => makeResolver(aliases), [aliases]);
@@ -1282,9 +1296,10 @@ export default function App() {
     const rec = await autoReconcile(ovrDate);
     if (rec) msg += reconcileSummary(rec);
     const dw = driftWarning(ovrDate);
-    msg += await clearNoDataOn(ovrDate);
+    if (noDataSet.has(ovrDate)) msg += `\n${ovrDate} は「データなし」のままです（台ごとのデータが無いため。アナスロか個別台を保存すると自動で外れます）。`;
     setOvrStatus({ type: dw ? "warn" : "ok", msg: msg + (dw || "") });
     setOvrText("");
+    setOvrDate(nextOpenDate(ovrDate, closedSet));
   }
 
   async function handleSaveAnaslo(force) {
@@ -1315,7 +1330,7 @@ export default function App() {
     msg += await clearNoDataOn(anaDate);
     setAnaStatus({ type: dw ? "warn" : "ok", msg: msg + (dw || "") });
     setAnaText("");
-    setAnaDate(addDays(anaDate, -1));
+    setAnaDate(nextOpenDate(anaDate, closedSet));
   }
 
   async function handleSaveIndividual() {
@@ -1354,9 +1369,11 @@ export default function App() {
     setBusy(false);
     let msg = toAdd.length ? `${kbDate}「${model}」${toAdd.length}台分を代用データとして保存しました（後でアナスロが入ると自動で上書き）。` : `${kbDate} はアナスロ登録済みのため、代用データは保存していません。`;
     if (skipped && toAdd.length) msg += `\n${skipped}台はアナスロ登録済みのため保存していません。`;
+    if (toAdd.length) msg += await clearNoDataOn(kbDate);
     if (Object.keys(learnedMap).length) msg += `\n台番号${Object.keys(learnedMap).join("・")}を「${model}」として覚えました（アナスロでは「${Object.values(learnedMap)[0].anasloName}」と表示されている台）。`;
     setKbStatus({ type: "ok", msg });
     setKbText("");
+    setKbDate(nextOpenDate(kbDate, closedSet));
   }
 
   // 保存した直後に、同じ日の民レポ／アナスロとずれていないかを確認する（ref から最新を読む）
@@ -1388,6 +1405,10 @@ export default function App() {
     if (rec.countMismatch.length) parts.push(`台数が合わない機種：${rec.countMismatch.map((x) => `${x.name}（民レポ${x.mCount}/アナスロ${x.aCount}）`).join("、")}`);
     return parts.length ? `\n${parts.join("\n")}` : "\n民レポとアナスロの機種はすべて一致しました。";
   }
+
+  // 店休日を選んでいる時は入力できない（v0.3.7）
+  const closedNotice = (d) => (closedSet.has(d) ? <div style={{ fontSize: 12, color: "#e5697a", fontWeight: 700, marginBottom: 8 }}>🚫 {d} は店休日です。入力できません（日付を変えてください）。</div> : null);
+  const lockedArea = (d) => (closedSet.has(d) ? { opacity: 0.35, pointerEvents: "none", background: "#0b0e13" } : {});
 
   // ---- 登録済み日付の削除（取り消し可）----
   async function deleteDate(kind, date) {
@@ -1497,7 +1518,7 @@ export default function App() {
     for (let x = from, i = 0; x <= to && i < 62; x = addDays(x, 1), i++) {
       if (noDataSet.has(x)) continue;
       if (closedSet.has(x)) { skipped.push(`${md(x)}（店休日）`); continue; }
-      if (rawRef.current[x] || ovrRef.current[x]) { skipped.push(`${md(x)}（データあり）`); continue; }
+      if (rawRef.current[x]) { skipped.push(`${md(x)}（アナスロあり）`); continue; }
       add.push({ date: x });
     }
     if (!add.length) { setNoDataStatus({ type: "error", msg: `登録できる日がありません。${skipped.join("、")}` }); return; }
@@ -1718,8 +1739,8 @@ export default function App() {
   const driftProblems = useMemo(() => (driftChecks ? Object.entries(driftChecks).filter(([, c]) => c.level === "warn" || c.level === "bad").sort((a, b) => b[0].localeCompare(a[0])) : []), [driftChecks]);
   const onlyOneSide = useMemo(() => {
     const all = new Set([...ovrDates, ...rawDates]);
-    return [...all].filter((d) => !(ovr[d] && raw[d] && unpackDay(raw[d]).some((x) => x.src !== "m"))).sort().reverse();
-  }, [ovrDates, rawDates, ovr, raw]);
+    return [...all].filter((d) => !noDataSet.has(d) && !(ovr[d] && raw[d] && unpackDay(raw[d]).some((x) => x.src !== "m"))).sort().reverse();
+  }, [ovrDates, rawDates, ovr, raw, noDataSet]);
   const [recDate, setRecDate] = useState("");
   const recDateEff = recDate && bothDates.includes(recDate) ? recDate : bothDates[bothDates.length - 1] || "";
   const recResult = useMemo(() => {
@@ -1754,11 +1775,11 @@ export default function App() {
   }, [viewMode, currentPage, pageNameKeys, allDays, resolve, displayNameOf]);
   const engine = useMemo(() => {
     if (!pageDays.length) return null;
-    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet });
+    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet, closedSet });
     const learned = learnSymbolPatternWeights(ctx);
-    const pick = scoreSymbolPickupToday(ctx, learned, closedSet, noDataSet);
+    const pick = scoreSymbolPickupToday(ctx, learned, closedSet, skipTargetSet);
     return { ctx, learned, pick };
-  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet]);
+  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet]);
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
   const machineLabel = (m) => (isMultiModel ? `${m.model} ${m.no}番` : `${m.no}番`);
 
@@ -2045,8 +2066,8 @@ export default function App() {
   const pickTitle = engine && engine.pick.target ? (() => {
     const t = engine.pick.target;
     const closedSk = [], noDataSk = [];
-    for (let x = addDays(engine.pick.lastDate, 1); x < t; x = addDays(x, 1)) (noDataSet.has(x) ? noDataSk : closedSk).push(md(x));
-    return `${md(t)}のピックアップ（実測パターン方式）${closedSk.length ? `　※${closedSk.join("・")}は店休日` : ""}${noDataSk.length ? `　※${noDataSk.join("・")}はデータなし（${md(engine.pick.lastDate)}の結果で予想）` : ""}`;
+    for (let x = addDays(engine.pick.lastDate, 1); x < t; x = addDays(x, 1)) (closedSet.has(x) ? closedSk : noDataSk).push(md(x));
+    return `${md(t)}のピックアップ（実測パターン方式）${closedSk.length ? `　※${closedSk.join("・")}は店休日` : ""}${noDataSk.length ? `　※${noDataSk.join("・")}は台ごとのデータなし（${md(engine.pick.lastDate)}の結果で予想）` : ""}`;
   })() : "ピックアップ（実測パターン方式）";
 
   // ---- 機種ページの部品（プラザ2と同じ見た目）----
@@ -2231,9 +2252,10 @@ export default function App() {
                 <div style={S.h}>① 民レポ（機種別サマリー＋バラエティ＋末尾別データ）</div>
                 <div style={S.note}>民レポの表を上から下までそのまま貼り付けてください。同じ日のアナスロがあれば、機種名と台数を自動で照合します。</div>
                 <input type="date" value={ovrDate} onChange={(e) => loadOvrDate(e.target.value)} style={{ ...S.input, marginBottom: 8 }} />
+                {closedNotice(ovrDate) || <div style={{ fontSize: 11, color: ovr[ovrDate] ? "#9ece6a" : "#5a6272", marginBottom: 8 }}>{ovr[ovrDate] ? "この日は登録済み（保存すると上書き）" : "この日はまだ未登録です"}</div>}
                 {eventsOn(ovrDate).length > 0 && <div style={{ fontSize: 12, color: "#e8b34c", marginBottom: 8 }}><Flag size={11} style={{ verticalAlign: -1 }} /> この日のイベント：{eventsOn(ovrDate).join("、")}</div>}
-                <textarea className="scrollbar" rows={8} value={ovrText} onChange={(e) => setOvrText(e.target.value)} placeholder={"機種\t平均差枚\t平均G数\t勝率\t出率\n…"} style={S.textarea} />
-                <button disabled={busy} onClick={handleSaveOverall} style={{ ...S.btn("#e8b34c", "#1b1508"), width: "100%", opacity: busy ? 0.6 : 1 }}>{busy ? "保存中..." : "この日の民レポを保存"}</button>
+                <textarea className="scrollbar" rows={8} disabled={closedSet.has(ovrDate)} value={ovrText} onChange={(e) => setOvrText(e.target.value)} placeholder={"機種\t平均差枚\t平均G数\t勝率\t出率\n…"} style={{ ...S.textarea, ...lockedArea(ovrDate) }} />
+                <button disabled={busy || closedSet.has(ovrDate)} onClick={handleSaveOverall} style={{ ...S.btn("#e8b34c", "#1b1508"), width: "100%", opacity: busy ? 0.6 : 1, ...lockedArea(ovrDate) }}>{busy ? "保存中..." : "この日の民レポを保存"}</button>
                 <Status s={ovrStatus} />
               </div>
 
@@ -2242,8 +2264,9 @@ export default function App() {
                 <div style={S.note}>アナスロの表をそのまま貼り付けてください（後ろの空白列・空行・「平均」行は自動で無視します）。正式名称が一致するページに自動で反映されます。</div>
                 <input type="date" value={anaDate} onChange={(e) => loadAnaDate(e.target.value)} style={{ ...S.input, marginBottom: 8 }} />
                 <div style={{ fontSize: 11, color: raw[anaDate] ? "#9ece6a" : "#5a6272", marginBottom: 8 }}>{raw[anaDate] ? `この日は登録済み（${unpackDay(raw[anaDate]).length}台）` : "この日はまだ未登録です"}</div>
-                <textarea className="scrollbar" rows={8} value={anaText} onChange={(e) => setAnaText(e.target.value)} placeholder={"機種名\t台番号\tG数\t差枚\tBB\tRB\t合成確率\tBB確率\tRB確率\n…"} style={S.textarea} />
-                <button disabled={busy} onClick={() => handleSaveAnaslo(false)} style={{ ...S.btn("#4fd1c5", "#0b1f1c"), width: "100%", opacity: busy ? 0.6 : 1 }}>{busy ? "保存中..." : "この日のアナスロを保存"}</button>
+                {closedNotice(anaDate)}
+                <textarea className="scrollbar" rows={8} disabled={closedSet.has(anaDate)} value={anaText} onChange={(e) => setAnaText(e.target.value)} placeholder={"機種名\t台番号\tG数\t差枚\tBB\tRB\t合成確率\tBB確率\tRB確率\n…"} style={{ ...S.textarea, ...lockedArea(anaDate) }} />
+                <button disabled={busy || closedSet.has(anaDate)} onClick={() => handleSaveAnaslo(false)} style={{ ...S.btn("#4fd1c5", "#0b1f1c"), width: "100%", opacity: busy ? 0.6 : 1, ...lockedArea(anaDate) }}>{busy ? "保存中..." : "この日のアナスロを保存"}</button>
                 {anaDup && (
                   <div style={{ marginTop: 8, padding: 10, borderRadius: 6, background: "#2a1418", border: "1px solid #7a3038", color: "#e5697a", fontSize: 12 }}>
                     ⚠ この内容は {anaDup} と完全に同じです。日付を間違えていませんか？
@@ -2264,8 +2287,9 @@ export default function App() {
                   <input list="model-names" value={kbModel} onChange={(e) => setKbModel(e.target.value)} placeholder="機種名（表の上の行が無い時だけ）" style={{ ...S.input, flex: "1 1 200px" }} />
                 </div>
                 {parseMinRepoIndividual(kbText).model && <div style={{ fontSize: 11, color: "#9ece6a", marginBottom: 8 }}>読み取った機種名：{parseMinRepoIndividual(kbText).model}</div>}
-                <textarea className="scrollbar" rows={6} value={kbText} onChange={(e) => setKbText(e.target.value)} placeholder={"○○ データ一覧\n台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n…"} style={S.textarea} />
-                <button disabled={busy} onClick={handleSaveIndividual} style={{ ...S.btn("#bb9af7"), width: "100%", opacity: busy ? 0.6 : 1 }}>{busy ? "保存中..." : "個別台データを保存"}</button>
+                {closedNotice(kbDate)}
+                <textarea className="scrollbar" rows={6} disabled={closedSet.has(kbDate)} value={kbText} onChange={(e) => setKbText(e.target.value)} placeholder={"○○ データ一覧\n台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n…"} style={{ ...S.textarea, ...lockedArea(kbDate) }} />
+                <button disabled={busy || closedSet.has(kbDate)} onClick={handleSaveIndividual} style={{ ...S.btn("#bb9af7"), width: "100%", opacity: busy ? 0.6 : 1, ...lockedArea(kbDate) }}>{busy ? "保存中..." : "個別台データを保存"}</button>
                 <Status s={kbStatus} />
               </div>
 
@@ -2378,6 +2402,7 @@ export default function App() {
                 <div className="scrollbar" style={{ maxHeight: 260, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5 }}>
                   {Array.from(new Set([...ovrDates, ...rawDates, ...noDataSet])).sort().reverse().map((d) => {
                     if (noDataSet.has(d) && !ovr[d] && !raw[d]) return <div key={d} style={{ ...S.row, color: "#e5697a" }}><span className="mono">{d}　📭 データなし</span></div>;
+                    const ndBadge = noDataSet.has(d) ? <span style={{ marginLeft: 6, color: "#e5697a" }}>📭台ごとのデータなし</span> : null;
                     const rows = raw[d] ? unpackDay(raw[d]) : [];
                     const man = rows.filter((r) => r.src === "m").length;
                     return (
@@ -2388,6 +2413,7 @@ export default function App() {
                           <span style={{ marginLeft: 6, color: ovr[d] ? "#9ece6a" : "#e5697a" }}>民レポ{ovr[d] ? "〇" : "未"}</span>
                           <span style={{ marginLeft: 6, color: rows.length - man ? "#9ece6a" : "#e5697a" }}>アナスロ{rows.length - man ? "〇" : "未"}</span>
                           {man > 0 && <span style={{ marginLeft: 6, color: "#bb9af7" }}>代用{man}台</span>}
+                          {ndBadge}
                           {driftChecks && driftChecks[d] && (driftChecks[d].level === "bad" || driftChecks[d].level === "warn") && <span style={{ marginLeft: 6, color: driftChecks[d].level === "bad" ? "#e5697a" : "#e8b34c", fontWeight: 700 }}>⚠ずれ</span>}
                         </span>
                         <span style={{ display: "flex", gap: 6, flexShrink: 0 }}>
