@@ -60,7 +60,17 @@ import { storage } from "./storage";
 //   民レポとのずれは1台あたり約6枚＝一致）。0のまま学習すると「差枚0・G数0」と誤学習するため。
 //   保存済みの過去データも読み込み時に同じ扱いにする。欠けた台は③個別台データで埋められる。
 // v0.3.10: 機種の手入力欄に予測変換（候補）が出なくなっていたのを修正（v0.2.1でプルダウンにした時に候補リストの指定を外していた）。
-export const APP_VERSION = "0.3.10";
+// v0.3.11: 欠けたアナスロの台を個別台（民レポ）で埋めた日に、④の照合・ずれチェックで「台数が違う」と出ていた
+//   不具合を修正。照合ではアナスロの行だけを見ていたので、埋めた台がアナスロ側から消えて見えていた
+//   （例：ヴァルヴレイヴ 民レポ20台／アナスロ17台、625・1065・1072が埋めた台）。照合・ずれチェックでは
+//   埋めた台（代用）も数える。ただしG数の種類の判定には代用の台を使わない（民レポのG数は総回転数のため）。
+//   アナスロが1台も無い日（代用だけの日）は照合しない。
+// v0.3.12: アナスロで全部0の台を、民レポを見て「稼働なし（0として数える）」と「データ欠け（数字なし）」に分けるように。
+//   v0.3.9では全部0の台を一律に欠け扱いしていたが、終日動かなかった台も全部0になるため、ほとんどの日に
+//   「欠け」が出ていた。機種ごとに、0を含めた平均と0を除いた平均のどちらが民レポの平均差枚に近いかで判定
+//   （台がすべて0の機種は、民レポで差枚・G数があれば欠け）。民レポが無い日は稼働なしとして扱う。
+//   保存はアナスロの数字のまま（0のまま）。判定は表示・照合・エンジンの直前に毎回行う。
+export const APP_VERSION = "0.3.12";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -239,10 +249,44 @@ export function parseOverallSummary(text) {
 
 // アナスロ：機種名/台番号/G数/差枚/BB/RB/合成/BB確率/RB確率（後ろに空の列・空の行が大量にある）。
 // 「平均」行は除外。G数は機種により「通常時」か「総回転数」か違う（同じ日の民レポと比べて自動判定）。
-// アナスロで全部0（G数・差枚・BB・RB）の台＝データ欠け（障害時など）。数字なし（null）として扱う。
-// 本当に誰も打たなかった台も全部0になるが、その日は判定不可（－）で差し支えない。
-export const isBlankRow = (r) => !r.g && !r.s && !r.bb && !r.rb;
-export const blankToNull = (r) => (isBlankRow(r) ? { ...r, g: null, s: null, bb: null, rb: null } : r);
+// アナスロで全部0（G数・差枚・BB・RB）の台。終日動かなかった台（稼働なし）と、障害などのデータ欠けの両方がある。
+// v0.3.9〜0.3.11で数字なし（null）として保存した台も同じ扱い。
+export const isBlankRow = (r) => r.src !== "m" && ((r.g === null && r.s === null) || (!r.g && !r.s && !r.bb && !r.rb));
+const asIdle = (r) => ({ ...r, g: 0, s: 0, bb: 0, rb: 0, idle: true });
+const asMissing = (r) => ({ ...r, g: null, s: null, bb: null, rb: null, missing: true });
+// 民レポを見て、全部0の台を「稼働なし（0）」か「欠け（null）」に分ける。民レポが無ければ全部「稼働なし」。
+// rows は em（照合用の機種名）付き。
+export function classifyBlankRows(rows, overall, resolve) {
+  if (!rows.some(isBlankRow)) return rows;
+  if (!overall) return rows.map((r) => (isBlankRow(r) ? asIdle(r) : r));
+  const variety = new Map(overall.modelRows.filter((r) => r.isVariety).map((r) => [r.no, r]));
+  const modelRow = new Map(overall.modelRows.filter((r) => !r.isVariety).map((r) => [resolve(r.name), r]));
+  const played = (m) => m && ((m.avgSada !== null && Math.abs(m.avgSada) > 30) || (m.avgGsu || 0) > 100 || m.hiddenNegative);
+  const groups = new Map();
+  rows.forEach((r) => { if (variety.has(r.no)) return; const k = resolve(r.em || r.m); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); });
+  const missingNos = new Set();
+  groups.forEach((rs, k) => {
+    const z = rs.filter(isBlankRow);
+    if (!z.length) return;
+    const m = modelRow.get(k);
+    if (!m || m.avgSada === null) return; // 民レポで比べられない → 稼働なし
+    const nz = rs.filter((r) => !isBlankRow(r) && r.s !== null);
+    if (m.total === nz.length) return; // 民レポがその台を数えていない＝動いていない
+    if (!nz.length) { if (played(m)) z.forEach((r) => missingNos.add(r.no)); return; }
+    const sum = nz.reduce((a, r) => a + r.s, 0);
+    const a0 = sum / (nz.length + z.length), a1 = sum / nz.length;
+    if (Math.abs(a1 - m.avgSada) < Math.abs(a0 - m.avgSada)) z.forEach((r) => missingNos.add(r.no));
+  });
+  rows.forEach((r) => { if (isBlankRow(r) && variety.has(r.no) && played(variety.get(r.no))) missingNos.add(r.no); });
+  return rows.map((r) => (isBlankRow(r) ? (missingNos.has(r.no) ? asMissing(r) : asIdle(r)) : r));
+}
+// 民レポとの照合用：アナスロの行＋欠けを埋めた代用（個別台）の行。アナスロが1台も無い日は照合しない（空）。
+export function reconRows(day, noModelMap, overall, resolve) {
+  const all = unpackDay(day);
+  if (!all.some((x) => x.src !== "m")) return [];
+  const rows = all.map((x) => ({ ...x, em: effectiveModelName(x, noModelMap) }));
+  return classifyBlankRows(rows, overall, resolve || normalizeModelName);
+}
 export function parseAnaslo(text) {
   const rows = [];
   const seen = new Set();
@@ -256,7 +300,7 @@ export function parseAnaslo(text) {
     if (no === null || !cols[0]) continue;
     if (seen.has(no)) dupNos.push(no);
     seen.add(no);
-    rows.push(blankToNull({ m: cols[0], no, g: parseIntLoose(cols[2]), s: parseIntLoose(cols[3]), bb: parseIntLoose(cols[4]), rb: parseIntLoose(cols[5]) }));
+    rows.push({ m: cols[0], no, g: parseIntLoose(cols[2]), s: parseIntLoose(cols[3]), bb: parseIntLoose(cols[4]), rb: parseIntLoose(cols[5]) });
   }
   return { rows, dupNos };
 }
@@ -295,7 +339,7 @@ export function packDay(rows) {
 }
 export function unpackDay(day) {
   if (!day || !Array.isArray(day.rows)) return [];
-  return day.rows.map(([mi, no, g, s, bb, rb, src]) => (src ? { m: day.models[mi], no, g, s, bb, rb, src: "m" } : blankToNull({ m: day.models[mi], no, g, s, bb, rb, src: "a" })));
+  return day.rows.map(([mi, no, g, s, bb, rb, src]) => ({ m: day.models[mi], no, g, s, bb, rb, src: src ? "m" : "a" }));
 }
 export function fingerprintRows(rows) {
   return [...rows].sort((a, b) => a.no - b.no).map((r) => `${r.no}:${r.s}:${r.g}:${r.bb}:${r.rb}`).join("|");
@@ -393,7 +437,7 @@ export function reconcileSameDay(overall, anasloRows, resolve) {
           else res.varietyNoMaps.push({ no: row.no, model: row.name, anasloName: a.m });
         } else res.varietyConflicts.push({ no: row.no, minrepoName: row.name, anasloName: a.em || a.m, sameData: same });
       }
-      if (same && row.avgGsu && a.g) res.gtypes.push({ name: row.name, ratio: a.g / row.avgGsu });
+      if (same && a.src !== "m" && row.avgGsu && a.g) res.gtypes.push({ name: row.name, ratio: a.g / row.avgGsu });
       return;
     }
     const k = resolve(row.name);
@@ -407,11 +451,11 @@ export function reconcileSameDay(overall, anasloRows, resolve) {
       if (active.length === row.total) { idleNos = g.rows.filter(isIdleRow).map((r) => r.no); rows = active; }
     }
     const aAvgS = avg(rows, (r) => r.s);
-    const aAvgG = avg(rows, (r) => r.g);
+    const aAvgG = avg(rows.filter((r) => !r.idle), (r) => r.g); // 稼働なし（0）の台はG数の判定に使わない
     const item = { name: row.name, key: k, mCount: row.total, aCount: g.rows.length, mAvg: row.avgSada, aAvg: aAvgS, mGsu: row.avgGsu, aGsu: aAvgG, idleNos, nos: g.rows.map((r) => r.no).sort((x, y) => x - y), idle: g.rows.filter(isIdleRow).map((r) => r.no) };
     res.matched.push(item);
     if (row.total !== rows.length) res.countMismatch.push(item);
-    else if (row.avgGsu && aAvgG) res.gtypes.push({ name: row.name, ratio: aAvgG / row.avgGsu });
+    else if (row.avgGsu && aAvgG && !rows.some((r) => r.src === "m")) res.gtypes.push({ name: row.name, ratio: aAvgG / row.avgGsu }); // 代用（民レポのG数）が混ざる機種は使わない
   });
   const freeGroups = [...groups.values()].filter((g) => !usedGroups.has(g.key));
   unmatchedMinrepo.forEach((row) => {
@@ -1180,8 +1224,8 @@ export default function App() {
   const ovrDates = useMemo(() => Object.keys(ovr).sort(), [ovr]);
   const allDays = useMemo(() => rawDates.map((date) => ({
     date,
-    rows: unpackDay(raw[date]).map((r) => ({ ...r, em: effectiveModelName(r, noModel) })),
-  })), [rawDates, raw, noModel]);
+    rows: classifyBlankRows(unpackDay(raw[date]).map((r) => ({ ...r, em: effectiveModelName(r, noModel) })), ovr[date], resolve),
+  })), [rawDates, raw, noModel, ovr, resolve]);
   const gtypeOf = useCallback((mk) => gtypeOfEntry(gtypes[mk]), [gtypes]);
   const profileByKey = useMemo(() => {
     const m = {};
@@ -1219,7 +1263,8 @@ export default function App() {
     const r = rawRef.current[date];
     if (!o || !r) return null;
     const res0 = makeResolver(kvRef.current[KEYS.aliases]);
-    const rows = unpackDay(r).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, kvRef.current[KEYS.noModel]) }));
+    const rows = reconRows(r, kvRef.current[KEYS.noModel], o, res0);
+    if (!rows.length) return null; // アナスロが無い日（代用だけ）は照合しない
     const rec = reconcileSameDay(o, rows, res0);
     // 民レポとアナスロが同じ日のデータだと確認できた時だけ、別名・台番号の対応・G数の種類を自動登録する
     const sameDay = driftLevel(compareMinrepoAnaslo(o, rows, res0)) === "ok";
@@ -1235,7 +1280,7 @@ export default function App() {
     });
     if (Object.keys(newNoMaps).length) await commitKV(KEYS.noModel, (prev) => ({ ...prev, ...newNoMaps }));
     const res1 = makeResolver(kvRef.current[KEYS.aliases]);
-    const rows1 = Object.keys(newNoMaps).length ? unpackDay(r).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, kvRef.current[KEYS.noModel]) })) : rows;
+    const rows1 = Object.keys(newNoMaps).length ? reconRows(r, kvRef.current[KEYS.noModel], o, res0) : rows;
     const rec2 = Object.keys(newAliases).length || Object.keys(newNoMaps).length ? reconcileSameDay(o, rows1, res1) : rec;
     const updates = {};
     rec2.gtypes.forEach((g) => {
@@ -1307,6 +1352,7 @@ export default function App() {
     const rec = await autoReconcile(ovrDate);
     if (rec) msg += reconcileSummary(rec);
     const dw = driftWarning(ovrDate);
+    msg += blankSummary(ovrDate);
     if (noDataSet.has(ovrDate)) msg += `\n${ovrDate} は「データなし」のままです（台ごとのデータが無いため。アナスロか個別台を保存すると自動で外れます）。`;
     setOvrStatus({ type: dw ? "warn" : "ok", msg: msg + (dw || "") });
     setOvrText("");
@@ -1326,22 +1372,18 @@ export default function App() {
     }
     setAnaDup(null);
     const existing = rawRef.current[anaDate] ? unpackDay(rawRef.current[anaDate]) : [];
-    const anaNos = new Set(rows.filter((r) => r.s !== null).map((r) => r.no)); // 数字があるアナスロの台
+    const anaNos = new Set(rows.filter((r) => !isBlankRow({ ...r, src: "a" })).map((r) => r.no)); // 数字があるアナスロの台（全部0の台は個別台で埋められる）
     const keptManual = existing.filter((r) => r.src === "m" && !anaNos.has(r.no)); // アナスロに無い・欠けている台の代用データは残す
     const keptNos = new Set(keptManual.map((r) => r.no));
     const replaced = existing.filter((r) => r.src === "m" && anaNos.has(r.no)).length;
     const all = [...rows.filter((r) => !keptNos.has(r.no)).map((r) => ({ ...r, src: "a" })), ...keptManual];
-    const blanks = rows.filter((r) => r.s === null && !keptNos.has(r.no));
+    const blankCount = rows.filter((r) => isBlankRow({ ...r, src: "a" }) && !keptNos.has(r.no)).length;
     setBusy(true);
     const res = await writeWeekly("raw", anaDate, packDay(all));
     setBusy(false);
     if (!res.ok) { setAnaStatus({ type: "error", msg: `保存に失敗しました：${res.error}` }); return; }
     let msg = `${anaDate} のアナスロを保存しました（${rows.length}台${replaced ? `・個別台の代用${replaced}台を上書き` : ""}${keptNos.size ? `・欠けている${keptNos.size}台は個別台の代用データを使用` : ""}）。`;
-    if (blanks.length) {
-      const byModel = {};
-      blanks.forEach((r) => { byModel[r.m] = (byModel[r.m] || 0) + 1; });
-      msg += `\n⚠ 数字が全部0の台が${blanks.length}台ありました（アナスロのデータ欠け）。この台は「数字なし」として保存し、学習には使いません。必要なら③個別台データで埋められます。\n　${Object.entries(byModel).sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m}（${n}台）`).join("、")}`;
-    }
+    if (blankCount) msg += blankSummary(anaDate);
     const rec = await autoReconcile(anaDate);
     if (rec) msg += reconcileSummary(rec);
     const dw = driftWarning(anaDate);
@@ -1359,31 +1401,28 @@ export default function App() {
     if (!parsed.rows.length) { setKbStatus({ type: "error", msg: "台番号の行を読み取れませんでした。" }); return; }
     if (closedSet.has(kbDate)) { setKbStatus({ type: "error", msg: `${kbDate} は店休日として登録されています。` }); return; }
     const existing = rawRef.current[kbDate] ? unpackDay(rawRef.current[kbDate]) : [];
-    const anaNos = new Set(existing.filter((r) => r.src !== "m" && r.s !== null).map((r) => r.no)); // 欠けているアナスロの台は個別台で埋められる
+    const anaNos = new Set(existing.filter((r) => r.src !== "m" && !isBlankRow(r)).map((r) => r.no)); // 全部0（稼働なし・欠け）のアナスロの台は個別台で埋められる
     const newNos = new Set(parsed.rows.map((r) => r.no));
     const toAdd = parsed.rows.filter((r) => !anaNos.has(r.no));
     const skipped = parsed.rows.length - toAdd.length;
     const addNos = new Set(toAdd.map((r) => r.no));
     // 同じ台番号の古い代用データと、欠けていたアナスロの行（数字なし）は、今回の個別台データに置き換える
-    const kept = existing.filter((r) => !(addNos.has(r.no) && (r.src === "m" || r.s === null)) && !(r.src === "m" && newNos.has(r.no)));
+    const kept = existing.filter((r) => !(addNos.has(r.no) && (r.src === "m" || isBlankRow(r))) && !(r.src === "m" && newNos.has(r.no)));
     const all = [...kept, ...toAdd.map((r) => ({ m: model, no: r.no, g: r.g, s: r.s, bb: r.bb, rb: r.rb, src: "m" }))];
     setBusy(true);
     let res = { ok: true };
     if (toAdd.length) res = await writeWeekly("raw", kbDate, packDay(all));
     if (!res.ok) { setBusy(false); setKbStatus({ type: "error", msg: `保存に失敗しました：${res.error}` }); return; }
     // 台番号→機種の対応を覚える（アナスロが別の名前でまとめて出している台だけ）
+    // v0.3.11：同じ日のアナスロに数字がある台だけで判断する（数字が同じ＝同じ台と確認できた時だけ）。
+    // 以前は近い別の日のアナスロを見ていたため、台の配置が違う日の機種名で間違って覚えることがあった。
     const res0 = makeResolver(kvRef.current[KEYS.aliases]);
     const learnedMap = {};
     parsed.rows.forEach((r) => {
-      const ds = Object.keys(rawRef.current).sort();
-      const near = [...ds.filter((d) => d <= kbDate).reverse(), ...ds.filter((d) => d > kbDate)];
-      for (const d of near) {
-        const a = unpackDay(rawRef.current[d]).find((x) => x.no === r.no && x.src !== "m");
-        if (a) {
-          if (res0(a.m) !== res0(model)) learnedMap[r.no] = { model, anasloName: a.m, since: kbDate };
-          break;
-        }
-      }
+      const a = existing.find((x) => x.no === r.no && x.src !== "m" && !isBlankRow(x));
+      if (!a || res0(a.m) === res0(model)) return;
+      const same = a.s === r.s || Math.abs((a.s ?? 0) - (r.s ?? 0)) <= Math.max(30, Math.abs(r.s ?? 0) * 0.03);
+      if (same) learnedMap[r.no] = { model, anasloName: a.m, since: kbDate };
     });
     if (Object.keys(learnedMap).length) await commitKV(KEYS.noModel, (prev) => ({ ...prev, ...learnedMap }));
     setBusy(false);
@@ -1396,13 +1435,31 @@ export default function App() {
     setKbDate(nextOpenDate(kbDate, closedSet));
   }
 
+  // 全部0の台の内訳（稼働なし／欠け）を説明する文
+  function blankSummary(date) {
+    const r = rawRef.current[date];
+    if (!r) return "";
+    const res0 = makeResolver(kvRef.current[KEYS.aliases]);
+    const o = ovrRef.current[date];
+    const rows = reconRows(r, kvRef.current[KEYS.noModel], o, res0);
+    const idle = rows.filter((x) => x.idle).length, miss = rows.filter((x) => x.missing);
+    if (!idle && !miss.length) return "";
+    if (!o) return `\n全部0の台が${idle}台あります。今は「終日稼働なし（0）」として数えます。同じ日の民レポを入れると、民レポでは動いていた台だけ自動で「データ欠け」に切り替わります。`;
+    let t = idle ? `\n全部0の台のうち${idle}台は、民レポと合うので「終日稼働なし（0）」として数えます。` : "";
+    if (miss.length) {
+      const byModel = {};
+      miss.forEach((x) => { byModel[x.m] = (byModel[x.m] || 0) + 1; });
+      t += `\n⚠ 民レポでは動いているのにアナスロが全部0の台が${miss.length}台あります（アナスロのデータ欠け）。この台は学習に使いません。必要なら③個別台データで埋められます。\n　${Object.entries(byModel).sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m}（${n}台）`).join("、")}`;
+    }
+    return t;
+  }
   // 保存した直後に、同じ日の民レポ／アナスロとずれていないかを確認する（ref から最新を読む）
   function driftWarning(date) {
     const o = ovrRef.current[date];
     const r = rawRef.current[date];
     if (!o || !r) return null;
     const res0 = makeResolver(kvRef.current[KEYS.aliases]);
-    const rows = unpackDay(r).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, kvRef.current[KEYS.noModel]) }));
+    const rows = reconRows(r, kvRef.current[KEYS.noModel], o, res0);
     if (!rows.length) return null;
     const c = compareMinrepoAnaslo(o, rows, res0);
     const level = driftLevel(c);
@@ -1664,7 +1721,15 @@ export default function App() {
   const bothDates = useMemo(() => ovrDates.filter((d) => raw[d]), [ovrDates, raw]);
   // ---- 怪しい別名・台番号の対応（名前が似ていない）v0.3.4 ----
   const suspiciousAliases = useMemo(() => Object.entries(aliases).filter(([k, v]) => !namesSimilar(k, v)).map(([k]) => k), [aliases]);
-  const suspiciousNoMaps = useMemo(() => Object.entries(noModel).filter(([, v]) => v && v.anasloName && !namesSimilar(v.anasloName, v.model)).map(([no]) => no), [noModel]);
+  // 台番号の対応は「名前が似ていない」か「登録した日のアナスロ（数字のある行）で、その台番号がその名前だったと確認できない」ものを怪しいとする
+  const suspiciousNoMaps = useMemo(() => Object.entries(noModel).filter(([no, v]) => {
+    if (!v || !v.anasloName) return false;
+    if (!namesSimilar(v.anasloName, v.model)) return true;
+    const day = v.since && raw[v.since];
+    if (!day) return true;
+    const a = unpackDay(day).find((x) => x.no === Number(no) && x.src !== "m" && !isBlankRow(x));
+    return !a || normalizeModelName(a.m) !== normalizeModelName(v.anasloName);
+  }).map(([no]) => no), [noModel, raw]);
   // G数の種類（通常時／総回転数）を、民レポとアナスロが同じ日と確認できた日だけから作り直す
   async function rebuildGtypes() {
     const res0 = makeResolver(kvRef.current[KEYS.aliases]);
@@ -1672,7 +1737,7 @@ export default function App() {
     Object.keys(ovrRef.current).sort().forEach((d) => {
       const r = rawRef.current[d];
       if (!r) return;
-      const rows = unpackDay(r).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, kvRef.current[KEYS.noModel]) }));
+      const rows = reconRows(r, kvRef.current[KEYS.noModel], ovrRef.current[d], res0);
       if (!rows.length || driftLevel(compareMinrepoAnaslo(ovrRef.current[d], rows, res0)) !== "ok") return;
       reconcileSameDay(ovrRef.current[d], rows, res0).gtypes.forEach((g) => {
         const t = gtypeFromRatio(g.ratio);
@@ -1699,7 +1764,7 @@ export default function App() {
     if (r1.ok && r2.ok) setNotice({ type: "ok", msg: `怪しい別名${suspiciousAliases.length}件・台番号の対応${suspiciousNoMaps.length}件を削除し、G数の種類を確認できた日だけから作り直しました（右下の操作履歴から元に戻せます）。` });
   }
   // ---- 民レポとアナスロのずれチェック（v0.3.2）----
-  const anasloRowsOf = useCallback((d) => (raw[d] ? unpackDay(raw[d]).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, noModel) })) : []), [raw, noModel]);
+  const anasloRowsOf = useCallback((d) => (raw[d] ? reconRows(raw[d], noModel, ovr[d], resolve) : []), [raw, noModel, ovr, resolve]);
   const driftChecks = useMemo(() => {
     if (viewMode !== "common" || !unlocked) return null;
     const out = {};
@@ -1765,7 +1830,7 @@ export default function App() {
   const recDateEff = recDate && bothDates.includes(recDate) ? recDate : bothDates[bothDates.length - 1] || "";
   const recResult = useMemo(() => {
     if (!recDateEff || viewMode !== "common" || !unlocked) return null;
-    const rows = unpackDay(raw[recDateEff]).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, noModel) }));
+    const rows = reconRows(raw[recDateEff], noModel, ovr[recDateEff], resolve);
     return reconcileSameDay(ovr[recDateEff], rows, resolve);
   }, [recDateEff, viewMode, unlocked, raw, ovr, noModel, resolve]);
   async function acceptAlias(anasloName, minrepoName) {
@@ -2268,7 +2333,7 @@ export default function App() {
                 <div style={{ ...S.card, borderColor: "#7a3038", background: "#24161a" }}>
                   <div style={{ ...S.h, color: "#e5697a" }}>⚠ 間違っている可能性が高い機種名の対応があります</div>
                   <div style={{ fontSize: 12, color: "#c7cbd4", lineHeight: 1.6, marginBottom: 8 }}>
-                    名前が全く似ていない機種どうしが「同じ機種」として登録されています。台移動の日に民レポとアナスロで台番号の中身が違ったため、以前の版が自動で登録してしまったものです。このままだと別の機種のデータが混ざります。
+                    名前が似ていない機種どうしや、登録した日のアナスロで確認できない台番号が「同じ機種」として登録されています。台移動の日や、欠けた台を個別台で埋めた日に、以前の版が別の日の配置を見て自動で登録してしまったものです。このままだと別の機種のデータが混ざります。
                     {suspiciousAliases.map((k) => <div key={k} className="mono" style={{ color: "#e8b34c" }}>・{k} → {aliases[k]}</div>)}
                     {suspiciousNoMaps.map((no) => <div key={no} className="mono" style={{ color: "#e8b34c" }}>・台番号{no}：{noModel[no].anasloName} → {noModel[no].model}</div>)}
                   </div>
@@ -2441,7 +2506,7 @@ export default function App() {
                           <span style={{ marginLeft: 6, color: ovr[d] ? "#9ece6a" : "#e5697a" }}>民レポ{ovr[d] ? "〇" : "未"}</span>
                           <span style={{ marginLeft: 6, color: rows.length - man ? "#9ece6a" : "#e5697a" }}>アナスロ{rows.length - man ? "〇" : "未"}</span>
                           {man > 0 && <span style={{ marginLeft: 6, color: "#bb9af7" }}>代用{man}台</span>}
-                          {rows.some((r) => r.src !== "m" && r.s === null) && <span style={{ marginLeft: 6, color: "#e8b34c" }}>アナスロ欠け{rows.filter((r) => r.src !== "m" && r.s === null).length}台</span>}
+                          {(() => { const miss = rows.some(isBlankRow) ? classifyBlankRows(rows.map((x) => ({ ...x, em: effectiveModelName(x, noModel) })), ovr[d], resolve).filter((x) => x.missing).length : 0; return miss ? <span style={{ marginLeft: 6, color: "#e8b34c" }}>アナスロ欠け{miss}台</span> : null; })()}
                           {ndBadge}
                           {driftChecks && driftChecks[d] && (driftChecks[d].level === "bad" || driftChecks[d].level === "warn") && <span style={{ marginLeft: 6, color: driftChecks[d].level === "bad" ? "#e5697a" : "#e8b34c", fontWeight: 700 }}>⚠ずれ</span>}
                         </span>
