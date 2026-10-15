@@ -59,7 +59,8 @@ import { storage } from "./storage";
 //   障害のあとのアナスロでは、民レポには数字がある台が全部0で出ていた（実データで108台。欠けとして扱うと
 //   民レポとのずれは1台あたり約6枚＝一致）。0のまま学習すると「差枚0・G数0」と誤学習するため。
 //   保存済みの過去データも読み込み時に同じ扱いにする。欠けた台は③個別台データで埋められる。
-export const APP_VERSION = "0.3.9";
+// v0.3.10: 機種の手入力欄に予測変換（候補）が出なくなっていたのを修正（v0.2.1でプルダウンにした時に候補リストの指定を外していた）。
+export const APP_VERSION = "0.3.10";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -1022,7 +1023,7 @@ function ModelChips({ names, onAdd, onRemove, placeholder, options, resolve, ico
         {opts.map((o) => <option key={o.key} value={o.name}>{o.name}{o.count ? `（${o.count}台）` : ""}</option>)}
       </select>
       <div style={{ display: "flex", gap: 6 }}>
-        <input value={v} onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} placeholder={placeholder || "一覧に無い機種は手入力"} style={{ ...S.input, flex: 1, fontSize: 12, padding: "5px 8px" }} />
+        <input list="model-names" value={v} onChange={(e) => setV(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} placeholder={placeholder || "機種名を入力（候補が出ます）"} style={{ ...S.input, flex: 1, fontSize: 12, padding: "5px 8px" }} />
         <button style={S.ghost} onClick={add}>追加</button>
       </div>
     </div>
