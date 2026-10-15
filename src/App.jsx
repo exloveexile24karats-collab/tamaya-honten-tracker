@@ -37,7 +37,17 @@ import { storage } from "./storage";
 //   民レポのバラエティ欄に載っている台番号は機種別の台数から外す（自動で台番号の対応も登録）、
 //   稼働なしの台（G数0・差枚0）を民レポが数えていない場合は一致とみなす、
 //   「民レポにだけある機種と合わせると台数が合う」組み合わせをヒント表示（例：GOLD＋ゴージャス）。
-export const APP_VERSION = "0.3.3";
+// v0.3.4: 【不具合修正】バラエティ台の台番号照合で、間違った別名が自動登録されていた
+//   （例：615番が民レポではクレア・アナスロでは鉄拳6だった日に「鉄拳6＝クレア」と登録され、
+//   鉄拳6の6台がクレアに混ざって8台になった）。本店はバラエティ台の台移動が多く、民レポとアナスロで
+//   移動の反映日がずれる・日付を取り違えると、同じ台番号でも別の機種になるため。
+//   修正：自動登録は「その日の民レポとアナスロが一致（ずれチェックOK）」「その台の差枚がほぼ同じ」
+//   「機種名が似ている」の3つがそろった時だけ。そろわない時は④に「名前が違う台」として表示するだけにする。
+//   あわせて、登録済みの別名・台番号の対応のうち名前が似ていない怪しいものを検出して一括削除できるようにした。
+// v0.3.5: 「データなしの日」（営業していたがデータが取れない日。例：10/6〜10/8のサイト障害）を登録できるように。
+//   店休日とは別扱い：データなしの日をまたぐ「前日→翌日」の組み合わせは学習に使わず、連続（×2連続など）も
+//   つなげない。予想日はデータなしの日も飛ばす。グラフには灰色の帯「なし」。キー slot-no-data-days-v1。
+export const APP_VERSION = "0.3.5";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -55,6 +65,7 @@ export const KEYS = {
   gtype: "slot-model-gtype-v1",
   eventTargets: "slot-event-targets-v1", // { イベント名: [機種名...] }（いつも同じ対象機種）
   dateEventTargets: "slot-date-event-targets-v1", // { 日付: { イベント名: [機種名...] } }（その日の対象機種）
+  noData: "slot-no-data-days-v1", // [{ date }] 営業していたがデータが取れない日（v0.3.5）
 };
 export const RAW_PREFIX = "slot-raw-fulltable-v1:week:";
 export const RAW_INDEX = "slot-raw-fulltable-index-v1";
@@ -84,10 +95,16 @@ export function weekStartOf(d) {
   const wd = weekdayOf(d);
   return addDays(d, wd === 0 ? -6 : 1 - wd);
 }
-export function nextOpenDate(d, closedSet) {
+export function nextOpenDate(d, closedSet, noDataSet) {
   let x = addDays(d, 1);
-  for (let i = 0; i < 60 && closedSet && closedSet.has(x); i++) x = addDays(x, 1);
+  for (let i = 0; i < 60 && ((closedSet && closedSet.has(x)) || (noDataSet && noDataSet.has(x))); i++) x = addDays(x, 1);
   return x;
+}
+// a と b（a<b）の間に「データなしの日」があるか
+export function hasNoDataBetween(a, b, noDataSet) {
+  if (!noDataSet || !noDataSet.size) return false;
+  for (let x = addDays(a, 1); x < b; x = addDays(x, 1)) if (noDataSet.has(x)) return true;
+  return false;
 }
 function todayStr() {
   const d = new Date();
@@ -305,8 +322,27 @@ export function estimateGsuFromSadaAndShutsu(sada, shutsu) {
 //  ・稼働なし（G数0・差枚0）の台は民レポが数えないことがあるので、それで台数が合えば「一致」とみなす
 //  ・合わない時は、民レポにだけある機種で台数の差を埋められる組み合わせ（例：GOLD 18台＝GOLD 11台＋ゴージャス 7台）をヒントに出す
 export const isIdleRow = (r) => !(r.g > 0) && !r.s;
+// 機種名が似ているか（正規化した名前の最長共通部分が3文字以上かつ短い方の4割以上、または包含）
+export function namesSimilar(a, b) {
+  const x = normalizeModelName(a).replace(/[’'"]/g, ""), y = normalizeModelName(b).replace(/[’'"]/g, "");
+  if (!x || !y) return false;
+  if (x.includes(y) || y.includes(x)) return true;
+  let best = 0;
+  const prev = new Array(y.length + 1).fill(0);
+  for (let i = 1; i <= x.length; i++) {
+    let diag = 0;
+    for (let j = 1; j <= y.length; j++) {
+      const tmp = prev[j];
+      prev[j] = x[i - 1] === y[j - 1] ? diag + 1 : 0;
+      if (prev[j] > best) best = prev[j];
+      diag = tmp;
+    }
+  }
+  return best >= 3 && best >= 0.4 * Math.min(x.length, y.length);
+}
+const sadaClose = (a, b) => a !== null && a !== undefined && b !== null && b !== undefined && Math.abs(a - b) <= Math.max(30, Math.abs(b) * 0.03);
 export function reconcileSameDay(overall, anasloRows, resolve) {
-  const res = { matched: [], suggestions: [], varietyAliases: [], varietyNoMaps: [], countMismatch: [], minrepoOnly: [], anasloOnly: [], gtypes: [] };
+  const res = { matched: [], suggestions: [], varietyAliases: [], varietyNoMaps: [], varietyConflicts: [], countMismatch: [], minrepoOnly: [], anasloOnly: [], gtypes: [] };
   if (!overall || !anasloRows || anasloRows.length === 0) return res;
   const nameCount = new Map();
   anasloRows.forEach((r) => { const k = resolve(r.em || r.m); nameCount.set(k, (nameCount.get(k) || 0) + 1); });
@@ -330,12 +366,17 @@ export function reconcileSameDay(overall, anasloRows, resolve) {
       const a = byNo.get(row.no);
       if (!a) { res.minrepoOnly.push(row); return; }
       const ak = resolve(a.em || a.m);
+      const same = sadaClose(a.s, row.avgSada);
       if (ak !== resolve(row.name)) {
-        // アナスロでその名前の台が1台だけなら機種名の別名、複数台あるなら台番号で振り分け
-        if ((nameCount.get(ak) || 0) <= 1) res.varietyAliases.push({ anasloName: a.em || a.m, minrepoName: row.name, no: row.no });
-        else res.varietyNoMaps.push({ no: row.no, model: row.name, anasloName: a.m });
+        // 自動登録は「差枚がほぼ同じ（同じ台の同じ日）」かつ「名前が似ている」時だけ。
+        // 台移動の反映日のずれ・日付の取り違えで、同じ台番号に別機種が入っていることがあるため。
+        if (same && namesSimilar(a.em || a.m, row.name)) {
+          // アナスロでその名前の台が1台だけなら機種名の別名、複数台あるなら台番号で振り分け
+          if ((nameCount.get(ak) || 0) <= 1) res.varietyAliases.push({ anasloName: a.em || a.m, minrepoName: row.name, no: row.no });
+          else res.varietyNoMaps.push({ no: row.no, model: row.name, anasloName: a.m });
+        } else res.varietyConflicts.push({ no: row.no, minrepoName: row.name, anasloName: a.em || a.m, sameData: same });
       }
-      if (row.avgGsu && a.g) res.gtypes.push({ name: row.name, ratio: a.g / row.avgGsu });
+      if (same && row.avgGsu && a.g) res.gtypes.push({ name: row.name, ratio: a.g / row.avgGsu });
       return;
     }
     const k = resolve(row.name);
@@ -543,6 +584,8 @@ export function buildSymbolContext(pageDays, opts) {
   const isSemi = o.isSemi || (() => false);
   const targetsOn = o.targetsOn || (() => new Map()); // date -> Map(イベント名 -> Set(機種キー))
   const dates = pageDays.map((d) => d.date);
+  // gapBefore[di]：dates[di-1] と dates[di] の間にデータなしの日がある（前日→翌日としてつなげない）
+  const gapBefore = dates.map((d, i) => i > 0 && hasNoDataBetween(dates[i - 1], d, o.noDataSet));
   const modelCtx = new Map();
   const getModelCtx = (mk) => {
     if (!modelCtx.has(mk)) {
@@ -583,7 +626,7 @@ export function buildSymbolContext(pageDays, opts) {
   const p80 = quantile(readingsForPct, 0.8);
   // 記号（§4-2）：読み取りの階層（p20/p50/p80）× 差枚
   machines.forEach((m) => m.recs.forEach((r) => { r.sym = classifySymbol(r, { p20, p50, p80 }); }));
-  return { dates, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length };
+  return { dates, gapBefore, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length };
 }
 export function classifySymbol(r, p) {
   if (!r.enough || r.reading === null || p.p20 === null || r.s === null || r.s === undefined) return "－";
@@ -602,7 +645,7 @@ export function patternKeysAt(ctx, m, i, target) {
   const s0 = sym(i), s1 = sym(i - 1), s2 = sym(i - 2);
   const d = r[i].date;
   // 連続性は「ページの日付で連続している記録」に限る
-  const contiguous = (k) => k >= 1 && r[k].di - r[k - 1].di === 1;
+  const contiguous = (k) => k >= 1 && r[k].di - r[k - 1].di === 1 && !(ctx.gapBefore && ctx.gapBefore[r[k].di]);
   const c1 = contiguous(i), c2 = c1 && contiguous(i - 1);
 
   // 前日結果
@@ -699,6 +742,7 @@ export function learnSymbolPatternWeights(ctx) {
     const r = m.recs;
     for (let i = 0; i + 1 < r.length; i++) {
       if (r[i + 1].di !== r[i].di + 1) continue; // 翌日（ページの次の日付）に記録がある時だけ
+      if (ctx.gapBefore && ctx.gapBefore[r[i + 1].di]) continue; // 間にデータなしの日がある組み合わせは使わない
       const nxt = r[i + 1].sym;
       if (nxt === "－") continue; // 判定不可は学習に使わない
       const good = isGood(nxt) ? 1 : 0;
@@ -727,11 +771,11 @@ export function learnSymbolPatternWeights(ctx) {
 }
 
 // 予想対象日のピックアップ（最新日に記録のある台だけ）
-export function scoreSymbolPickupToday(ctx, learned, closedSet) {
+export function scoreSymbolPickupToday(ctx, learned, closedSet, noDataSet) {
   const n = ctx.dates.length;
   if (!n) return { target: null, list: [] };
   const lastDi = n - 1;
-  const target = nextOpenDate(ctx.dates[lastDi], closedSet);
+  const target = nextOpenDate(ctx.dates[lastDi], closedSet, noDataSet);
   const list = [];
   ctx.machines.forEach((m) => {
     const i = m.recs.length - 1;
@@ -814,6 +858,7 @@ export function walkForwardBacktest(pageDays, opts, closedSet, warmup = 20) {
     const ctx = buildSymbolContext(sub, opts);
     const learned = learnSymbolPatternWeights(ctx);
     const actualNext = pageDays[t + 1].date;
+    if (full.gapBefore[t + 1]) continue; // データなしの日をまたぐ予想は採点しない
     ctx.machines.forEach((m) => {
       const i = m.recs.length - 1;
       if (i < 0 || m.recs[i].di !== t) return;
@@ -844,7 +889,7 @@ function joinNames(list) {
 const KV_DEFAULTS = {
   [KEYS.pages]: [], [KEYS.eventNames]: [], [KEYS.strong]: [], [KEYS.semi]: [], [KEYS.closed]: [],
   [KEYS.dateEvent]: {}, [KEYS.undo]: [], [KEYS.aliases]: {}, [KEYS.noModel]: {}, [KEYS.gtype]: {},
-  [KEYS.eventTargets]: {}, [KEYS.dateEventTargets]: {},
+  [KEYS.eventTargets]: {}, [KEYS.dateEventTargets]: {}, [KEYS.noData]: [],
 };
 const NO_EVENT_LABEL = "イベント無し";
 const DIGIT2_COLOR = "#7dcfff";
@@ -1095,6 +1140,7 @@ export default function App() {
   const gtypes = kv[KEYS.gtype];
   const dateEvent = kv[KEYS.dateEvent];
   const closedSet = useMemo(() => new Set(kv[KEYS.closed].map((c) => c.date)), [kv]);
+  const noDataSet = useMemo(() => new Set((kv[KEYS.noData] || []).map((c) => c.date)), [kv]);
   const strongNames = useMemo(() => new Set(kv[KEYS.strong].map((s) => s.name)), [kv]);
   const semiNames = useMemo(() => new Set(kv[KEYS.semi].map((s) => s.name)), [kv]);
   const resolve = useMemo(() => makeResolver(aliases), [aliases]);
@@ -1150,6 +1196,9 @@ export default function App() {
     const res0 = makeResolver(kvRef.current[KEYS.aliases]);
     const rows = unpackDay(r).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, kvRef.current[KEYS.noModel]) }));
     const rec = reconcileSameDay(o, rows, res0);
+    // 民レポとアナスロが同じ日のデータだと確認できた時だけ、別名・台番号の対応・G数の種類を自動登録する
+    const sameDay = driftLevel(compareMinrepoAnaslo(o, rows, res0)) === "ok";
+    if (!sameDay) return { ...rec, varietyAliases: [], varietyNoMaps: [], notSameDay: true };
     const newAliases = {};
     rec.varietyAliases.forEach((v) => { newAliases[normalizeModelName(v.anasloName)] = v.minrepoName; });
     if (Object.keys(newAliases).length) await commitKV(KEYS.aliases, (prev) => ({ ...prev, ...newAliases }));
@@ -1233,6 +1282,7 @@ export default function App() {
     const rec = await autoReconcile(ovrDate);
     if (rec) msg += reconcileSummary(rec);
     const dw = driftWarning(ovrDate);
+    msg += await clearNoDataOn(ovrDate);
     setOvrStatus({ type: dw ? "warn" : "ok", msg: msg + (dw || "") });
     setOvrText("");
   }
@@ -1262,6 +1312,7 @@ export default function App() {
     const rec = await autoReconcile(anaDate);
     if (rec) msg += reconcileSummary(rec);
     const dw = driftWarning(anaDate);
+    msg += await clearNoDataOn(anaDate);
     setAnaStatus({ type: dw ? "warn" : "ok", msg: msg + (dw || "") });
     setAnaText("");
     setAnaDate(addDays(anaDate, -1));
@@ -1330,6 +1381,7 @@ export default function App() {
 
   function reconcileSummary(rec) {
     const parts = [];
+    if (rec.notSameDay) parts.push("民レポとアナスロが同じ日のデータか確認できなかったので、機種名の自動登録はしていません。");
     if (rec.varietyAliases.length) parts.push(`バラエティ台の名前違い${rec.varietyAliases.length}件を台番号で自動照合しました。`);
     if (rec.varietyNoMaps && rec.varietyNoMaps.length) parts.push(`民レポでバラエティ（別機種の1台）として載っている台番号${rec.varietyNoMaps.map((v) => v.no).join("・")}を、台番号で振り分けるように登録しました。`);
     if (rec.suggestions.length) parts.push(`名前が違う機種の候補が${rec.suggestions.length}件あります →「機種名の照合」で確認してください。`);
@@ -1434,6 +1486,37 @@ export default function App() {
     const r = await commitKV(KEYS.closed, (prev) => [...prev, { date: closedDate }]);
     if (r.ok) setClosedDate(addDays(closedDate, 1));
   }
+  // ---- データなしの日（v0.3.5）----
+  const [noDataFrom, setNoDataFrom] = useState("");
+  const [noDataTo, setNoDataTo] = useState("");
+  const [noDataStatus, setNoDataStatus] = useState(null);
+  async function addNoData() {
+    const from = noDataFrom, to = noDataTo && noDataTo >= noDataFrom ? noDataTo : noDataFrom;
+    if (!from) { setNoDataStatus({ type: "error", msg: "日付を選んでください。" }); return; }
+    const add = [], skipped = [];
+    for (let x = from, i = 0; x <= to && i < 62; x = addDays(x, 1), i++) {
+      if (noDataSet.has(x)) continue;
+      if (closedSet.has(x)) { skipped.push(`${md(x)}（店休日）`); continue; }
+      if (rawRef.current[x] || ovrRef.current[x]) { skipped.push(`${md(x)}（データあり）`); continue; }
+      add.push({ date: x });
+    }
+    if (!add.length) { setNoDataStatus({ type: "error", msg: `登録できる日がありません。${skipped.join("、")}` }); return; }
+    const r = await commitKV(KEYS.noData, (prev) => [...(prev || []), ...add]);
+    if (!r.ok) { setNoDataStatus({ type: "error", msg: `保存に失敗しました：${r.error}` }); return; }
+    setNoDataStatus({ type: "ok", msg: `${add.map((x) => md(x.date)).join("・")} をデータなしの日として登録しました。${skipped.length ? `（${skipped.join("、")}は登録していません）` : ""}` });
+    setNoDataFrom(""); setNoDataTo("");
+  }
+  async function removeNoData(date) {
+    const prev = kvRef.current[KEYS.noData];
+    const r = await commitKV(KEYS.noData, (p) => (p || []).filter((c) => c.date !== date));
+    if (r.ok) pushUndo({ label: `データなしの日 ${date} を解除`, kind: "kv", key: KEYS.noData, prev });
+  }
+  // データを保存できた日にデータなしの印が付いていたら、自動で外す（あとからデータが復旧した場合）
+  async function clearNoDataOn(date) {
+    if (!(kvRef.current[KEYS.noData] || []).some((c) => c.date === date)) return "";
+    const r = await commitKV(KEYS.noData, (p) => (p || []).filter((c) => c.date !== date));
+    return r.ok ? `\n${date} はデータなしの日として登録されていたので、印を外しました。` : "";
+  }
   async function removeClosed(date) {
     const prev = kvRef.current[KEYS.closed];
     const r = await commitKV(KEYS.closed, (p) => p.filter((c) => c.date !== date));
@@ -1486,6 +1569,7 @@ export default function App() {
       strongEvents: kv[KEYS.strong],
       semiEvents: kv[KEYS.semi],
       closedDays: kv[KEYS.closed],
+      noDataDays: kv[KEYS.noData] || [],
       overallSummaries: ovrDates.map((d) => ({ date: d, event: dateEvent[d] || "", ...ovr[d] })),
       eventNames: kv[KEYS.eventNames],
       rawFullTable: raw,
@@ -1518,7 +1602,7 @@ export default function App() {
       setImportStatus({ type: "warn", msg: "取り込み中..." });
       const kvPairs = [
         [KEYS.pages, obj.pages], [KEYS.eventNames, obj.eventNames], [KEYS.strong, obj.strongEvents], [KEYS.semi, obj.semiEvents],
-        [KEYS.closed, obj.closedDays], [KEYS.dateEvent, obj.dateEventMap], [KEYS.aliases, obj.modelAliases], [KEYS.noModel, obj.noModelMap], [KEYS.gtype, obj.modelGTypes],
+        [KEYS.closed, obj.closedDays], [KEYS.noData, obj.noDataDays], [KEYS.dateEvent, obj.dateEventMap], [KEYS.aliases, obj.modelAliases], [KEYS.noModel, obj.noModelMap], [KEYS.gtype, obj.modelGTypes],
         [KEYS.eventTargets, obj.eventTargets], [KEYS.dateEventTargets, obj.dateEventTargets],
       ];
       for (const [k, v] of kvPairs) if (v !== undefined) { const r = await commitKV(k, () => v); if (!r.ok) throw new Error(r.error); }
@@ -1537,6 +1621,42 @@ export default function App() {
 
   // ---- 機種名の照合（画面表示用）----
   const bothDates = useMemo(() => ovrDates.filter((d) => raw[d]), [ovrDates, raw]);
+  // ---- 怪しい別名・台番号の対応（名前が似ていない）v0.3.4 ----
+  const suspiciousAliases = useMemo(() => Object.entries(aliases).filter(([k, v]) => !namesSimilar(k, v)).map(([k]) => k), [aliases]);
+  const suspiciousNoMaps = useMemo(() => Object.entries(noModel).filter(([, v]) => v && v.anasloName && !namesSimilar(v.anasloName, v.model)).map(([no]) => no), [noModel]);
+  // G数の種類（通常時／総回転数）を、民レポとアナスロが同じ日と確認できた日だけから作り直す
+  async function rebuildGtypes() {
+    const res0 = makeResolver(kvRef.current[KEYS.aliases]);
+    const next = {};
+    Object.keys(ovrRef.current).sort().forEach((d) => {
+      const r = rawRef.current[d];
+      if (!r) return;
+      const rows = unpackDay(r).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, kvRef.current[KEYS.noModel]) }));
+      if (!rows.length || driftLevel(compareMinrepoAnaslo(ovrRef.current[d], rows, res0)) !== "ok") return;
+      reconcileSameDay(ovrRef.current[d], rows, res0).gtypes.forEach((g) => {
+        const t = gtypeFromRatio(g.ratio);
+        if (!t) return;
+        const k = res0(g.name);
+        const e = next[k] || (next[k] = { normal: 0, total: 0, dates: [] });
+        e[t] += 1;
+        e.dates = [...e.dates, d].slice(-60);
+        e.lastRatio = Math.round(g.ratio * 1000) / 1000;
+        e.lastDate = d;
+      });
+    });
+    return commitKV(KEYS.gtype, () => next);
+  }
+  async function removeSuspicious() {
+    const prevA = kvRef.current[KEYS.aliases], prevN = kvRef.current[KEYS.noModel];
+    const r1 = await commitKV(KEYS.aliases, (p) => { const n = { ...p }; suspiciousAliases.forEach((k) => delete n[k]); return n; });
+    const r2 = await commitKV(KEYS.noModel, (p) => { const n = { ...p }; suspiciousNoMaps.forEach((k) => delete n[k]); return n; });
+    if (r1.ok) pushUndo({ label: `怪しい別名${suspiciousAliases.length}件を削除`, kind: "kv", key: KEYS.aliases, prev: prevA });
+    if (r2.ok && suspiciousNoMaps.length) pushUndo({ label: `怪しい台番号の対応${suspiciousNoMaps.length}件を削除`, kind: "kv", key: KEYS.noModel, prev: prevN });
+    const prevG = kvRef.current[KEYS.gtype];
+    const r3 = await rebuildGtypes();
+    if (r3.ok) pushUndo({ label: "G数の種類を作り直し", kind: "kv", key: KEYS.gtype, prev: prevG });
+    if (r1.ok && r2.ok) setNotice({ type: "ok", msg: `怪しい別名${suspiciousAliases.length}件・台番号の対応${suspiciousNoMaps.length}件を削除し、G数の種類を確認できた日だけから作り直しました（右下の操作履歴から元に戻せます）。` });
+  }
   // ---- 民レポとアナスロのずれチェック（v0.3.2）----
   const anasloRowsOf = useCallback((d) => (raw[d] ? unpackDay(raw[d]).filter((x) => x.src !== "m").map((x) => ({ ...x, em: effectiveModelName(x, noModel) })) : []), [raw, noModel]);
   const driftChecks = useMemo(() => {
@@ -1634,11 +1754,11 @@ export default function App() {
   }, [viewMode, currentPage, pageNameKeys, allDays, resolve, displayNameOf]);
   const engine = useMemo(() => {
     if (!pageDays.length) return null;
-    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn });
+    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet });
     const learned = learnSymbolPatternWeights(ctx);
-    const pick = scoreSymbolPickupToday(ctx, learned, closedSet);
+    const pick = scoreSymbolPickupToday(ctx, learned, closedSet, noDataSet);
     return { ctx, learned, pick };
-  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet]);
+  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet]);
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
   const machineLabel = (m) => (isMultiModel ? `${m.model} ${m.no}番` : `${m.no}番`);
 
@@ -1719,25 +1839,27 @@ export default function App() {
     const first = pageDates[0], last = pageDates[lastPageDi];
     const set = new Set(pageDates);
     closedSet.forEach((d) => { if (d >= first && d <= last) set.add(d); });
+    noDataSet.forEach((d) => { if (d >= first && d <= last) set.add(d); });
     return [...set].sort();
-  }, [pageDates, lastPageDi, closedSet]);
+  }, [pageDates, lastPageDi, closedSet, noDataSet]);
   const visibleDates = useMemo(() => {
     if (useCustomRange && customStart && customEnd) return timelineDates.filter((d) => d >= customStart && d <= customEnd);
     if (range === "all") return timelineDates;
     // 「○日足」はデータのある日で数える（店休日は数に入れない）
-    const dataDays = timelineDates.filter((d) => !closedSet.has(d));
+    const dataDays = timelineDates.filter((d) => !closedSet.has(d) && !noDataSet.has(d));
     const start = dataDays.length > range ? dataDays[dataDays.length - range] : dataDays[0];
     return timelineDates.filter((d) => d >= start);
-  }, [timelineDates, range, useCustomRange, customStart, customEnd, closedSet]);
+  }, [timelineDates, range, useCustomRange, customStart, customEnd, closedSet, noDataSet]);
   const chartData = useMemo(() => visibleDates.map((date) => {
     const row = { date, event: eventsOn(date).join("、"), closed: closedSet.has(date) };
     selected.forEach((k) => { const r = recOf(k, date); row[k] = r && r.s !== null ? r.s : null; });
     return row;
   }), [visibleDates, selected, recOf, eventsOn, closedSet]);
   const chartMarks = useMemo(() => {
-    const out = { closed: [], d2: [], d7: [], strong: [], semi: [], ev: [] };
+    const out = { closed: [], nodata: [], d2: [], d7: [], strong: [], semi: [], ev: [] };
     visibleDates.forEach((d) => {
       if (closedSet.has(d)) out.closed.push(d);
+      if (noDataSet.has(d)) out.nodata.push(d);
       const dd = parseInt(d.slice(8, 10), 10) % 10;
       if (dd === 2) out.d2.push(d);
       if (dd === 7) out.d7.push(d);
@@ -1748,7 +1870,7 @@ export default function App() {
       else out.ev.push({ date: d, name: names[0] });
     });
     return out;
-  }, [visibleDates, closedSet, eventsOn, isStrong, isSemi, strongNames, semiNames]);
+  }, [visibleDates, closedSet, noDataSet, eventsOn, isStrong, isSemi, strongNames, semiNames]);
   // 台別チャート（選んだ期間の累計差枚）
   const cumSeries = useCallback((key, dates) => {
     let cum = 0, started = false, last = null;
@@ -1922,9 +2044,9 @@ export default function App() {
 
   const pickTitle = engine && engine.pick.target ? (() => {
     const t = engine.pick.target;
-    const skipped = [];
-    for (let x = addDays(engine.pick.lastDate, 1); x < t; x = addDays(x, 1)) skipped.push(md(x));
-    return `${md(t)}のピックアップ（実測パターン方式）${skipped.length ? `　※${skipped.join("・")}は店休日` : ""}`;
+    const closedSk = [], noDataSk = [];
+    for (let x = addDays(engine.pick.lastDate, 1); x < t; x = addDays(x, 1)) (noDataSet.has(x) ? noDataSk : closedSk).push(md(x));
+    return `${md(t)}のピックアップ（実測パターン方式）${closedSk.length ? `　※${closedSk.join("・")}は店休日` : ""}${noDataSk.length ? `　※${noDataSk.join("・")}はデータなし（${md(engine.pick.lastDate)}の結果で予想）` : ""}`;
   })() : "ピックアップ（実測パターン方式）";
 
   // ---- 機種ページの部品（プラザ2と同じ見た目）----
@@ -2093,6 +2215,18 @@ export default function App() {
             </div>
           ) : (
             <>
+              {(suspiciousAliases.length > 0 || suspiciousNoMaps.length > 0) && (
+                <div style={{ ...S.card, borderColor: "#7a3038", background: "#24161a" }}>
+                  <div style={{ ...S.h, color: "#e5697a" }}>⚠ 間違っている可能性が高い機種名の対応があります</div>
+                  <div style={{ fontSize: 12, color: "#c7cbd4", lineHeight: 1.6, marginBottom: 8 }}>
+                    名前が全く似ていない機種どうしが「同じ機種」として登録されています。台移動の日に民レポとアナスロで台番号の中身が違ったため、以前の版が自動で登録してしまったものです。このままだと別の機種のデータが混ざります。
+                    {suspiciousAliases.map((k) => <div key={k} className="mono" style={{ color: "#e8b34c" }}>・{k} → {aliases[k]}</div>)}
+                    {suspiciousNoMaps.map((no) => <div key={no} className="mono" style={{ color: "#e8b34c" }}>・台番号{no}：{noModel[no].anasloName} → {noModel[no].model}</div>)}
+                  </div>
+                  <button onClick={removeSuspicious} style={S.btn("#e5697a")}>これらをまとめて削除する</button>
+                  <div style={{ fontSize: 11, color: "#8b93a3", marginTop: 6 }}>削除しても右下の「操作履歴」から元に戻せます。</div>
+                </div>
+              )}
               <div style={S.card}>
                 <div style={S.h}>① 民レポ（機種別サマリー＋バラエティ＋末尾別データ）</div>
                 <div style={S.note}>民レポの表を上から下までそのまま貼り付けてください。同じ日のアナスロがあれば、機種名と台数を自動で照合します。</div>
@@ -2152,13 +2286,18 @@ export default function App() {
                             <button style={{ ...S.ghost, color: "#9ece6a", borderColor: "#2f4a2a", flexShrink: 0 }} onClick={() => acceptAlias(s.anasloName, s.minrepoName)}>同じ機種として登録</button>
                           </div>
                         ))}
-                        {recResult.countMismatch.map((x) => (
-                          <div key={x.key} style={{ ...S.row, color: "#e8b34c", display: "block" }}>
+                        {recResult.countMismatch.map((x, i) => (
+                          <div key={`${x.key}-${i}`} style={{ ...S.row, color: "#e8b34c", display: "block" }}>
                             台数が違う：「{x.name}」民レポ{x.mCount}台 / アナスロ{x.aCount}台
                             {x.comboWith ? <div style={{ color: "#9ece6a", marginTop: 2 }}>→ 民レポの「{x.comboWith.name}」（{x.comboWith.count}台）と合わせると一致します。アナスロが2機種を1つの名前でまとめています。「{x.comboWith.name}」の個別台データ（③）を一度貼ると台番号で分けられます。</div>
                               : <div style={{ color: "#8b93a3", marginTop: 2 }}>→ アナスロの台番号：<span className="mono">{x.nos.join(", ")}</span>{x.idle.length > 0 && `（稼働なし：${x.idle.join(", ")}）`}。下の履歴で、いつから合わなくなったか（台番号の増減）を確認できます。</div>}
                           </div>
                         ))}
+                        {recResult.varietyConflicts.length > 0 && (
+                          <div style={{ color: "#8b93a3" }}>同じ台番号で機種名が違う台（自動では同じ機種にしていません）：
+                            {recResult.varietyConflicts.map((v) => <div key={v.no} className="mono" style={{ fontSize: 11 }}>・{v.no}番：民レポ「{v.minrepoName}」／アナスロ「{v.anasloName}」{v.sameData ? "（数字は一致）" : "（数字も違う＝台移動の反映日のずれか日付の取り違え）"}</div>)}
+                          </div>
+                        )}
                         {recResult.minrepoOnly.length > 0 && <div style={{ color: "#e5697a" }}>アナスロに見つからない：{recResult.minrepoOnly.map((r) => r.name + (r.no ? `(${r.no})` : "")).join("、")}</div>}
                         {recResult.anasloOnly.length > 0 && <div style={{ color: "#e5697a" }}>民レポに見つからない：{recResult.anasloOnly.map((g) => `${g.name}(${g.count}台)`).join("、")}</div>}
                       </div>
@@ -2194,7 +2333,7 @@ export default function App() {
                 <Collapse title={`登録済みの別名（${Object.keys(aliases).length}）・台番号の対応（${Object.keys(noModel).length}）・G数の種類（${Object.keys(gtypes).length}）`}>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11.5 }}>
                     {Object.entries(aliases).map(([k, v]) => (
-                      <div key={k} style={S.row}><span>別名：{k} → {v}</span><button style={S.ghost} onClick={async () => { const prev = kvRef.current[KEYS.aliases]; const r = await commitKV(KEYS.aliases, (p) => { const n = { ...p }; delete n[k]; return n; }); if (r.ok) pushUndo({ label: `別名「${k}」を削除`, kind: "kv", key: KEYS.aliases, prev }); }}><Trash2 size={11} /></button></div>
+                      <div key={k} style={S.row}><span style={{ color: !namesSimilar(k, v) ? "#e5697a" : undefined }}>{!namesSimilar(k, v) && "⚠ "}別名：{k} → {v}</span><button style={S.ghost} onClick={async () => { const prev = kvRef.current[KEYS.aliases]; const r = await commitKV(KEYS.aliases, (p) => { const n = { ...p }; delete n[k]; return n; }); if (r.ok) pushUndo({ label: `別名「${k}」を削除`, kind: "kv", key: KEYS.aliases, prev }); }}><Trash2 size={11} /></button></div>
                     ))}
                     {Object.entries(noModel).map(([no, v]) => (
                       <div key={no} style={S.row}><span>台番号{no}：アナスロ「{v.anasloName}」→「{v.model}」（{v.since}〜）</span><button style={S.ghost} onClick={async () => { const prev = kvRef.current[KEYS.noModel]; const r = await commitKV(KEYS.noModel, (p) => { const n = { ...p }; delete n[no]; return n; }); if (r.ok) pushUndo({ label: `台番号${no}の対応を削除`, kind: "kv", key: KEYS.noModel, prev }); }}><Trash2 size={11} /></button></div>
@@ -2235,9 +2374,10 @@ export default function App() {
                 )}
               </div>
 
-              <Collapse title={`登録済みの日付（${new Set([...ovrDates, ...rawDates]).size}日）`} defaultOpen>
+              <Collapse title={`登録済みの日付（${new Set([...ovrDates, ...rawDates]).size}日${noDataSet.size ? `・データなし${noDataSet.size}日` : ""}）`} defaultOpen>
                 <div className="scrollbar" style={{ maxHeight: 260, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5 }}>
-                  {Array.from(new Set([...ovrDates, ...rawDates])).sort().reverse().map((d) => {
+                  {Array.from(new Set([...ovrDates, ...rawDates, ...noDataSet])).sort().reverse().map((d) => {
+                    if (noDataSet.has(d) && !ovr[d] && !raw[d]) return <div key={d} style={{ ...S.row, color: "#e5697a" }}><span className="mono">{d}　📭 データなし</span></div>;
                     const rows = raw[d] ? unpackDay(raw[d]) : [];
                     const man = rows.filter((r) => r.src === "m").length;
                     return (
@@ -2320,6 +2460,16 @@ export default function App() {
                     <button onClick={addClosed} style={S.btn("#3a4150", "#e7e9ee")}>登録</button>
                   </div>
                   {[...kv[KEYS.closed]].sort((a, b) => b.date.localeCompare(a.date)).map((c) => <div key={c.date} style={{ ...S.row, marginBottom: 4 }}><span className="mono">{c.date}　休</span><button style={S.ghost} onClick={() => removeClosed(c.date)}><Trash2 size={11} /></button></div>)}
+                  <div style={{ ...S.h, marginTop: 14 }}>📭 データなしの日</div>
+                  <div style={{ ...S.note, marginBottom: 6 }}>お店は営業していたのに、民レポ・アナスロのデータが取れない日（サイトの障害など）。店休日とは違い、この日をまたいで「前日→翌日」をつなげないので、予想が間違って学習されません。連続した日は「〜」で期間をまとめて登録できます。あとからデータを保存すると、印は自動で外れます。</div>
+                  <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <input type="date" value={noDataFrom} onChange={(e) => setNoDataFrom(e.target.value)} style={{ ...S.input, flex: "1 1 120px" }} />
+                    <span style={{ fontSize: 11, color: "#5a6272" }}>〜</span>
+                    <input type="date" value={noDataTo} onChange={(e) => setNoDataTo(e.target.value)} style={{ ...S.input, flex: "1 1 120px" }} />
+                    <button onClick={addNoData} style={S.btn("#7a3038", "#e7e9ee")}>登録</button>
+                  </div>
+                  <Status s={noDataStatus} />
+                  {[...(kv[KEYS.noData] || [])].sort((a, b) => b.date.localeCompare(a.date)).map((c) => <div key={c.date} style={{ ...S.row, marginBottom: 4, marginTop: 4 }}><span className="mono">{c.date}　<span style={{ color: "#e5697a" }}>データなし</span></span><button style={S.ghost} onClick={() => removeNoData(c.date)}><Trash2 size={11} /></button></div>)}
                 </div>
               </div>
 
@@ -2642,6 +2792,7 @@ export default function App() {
                         {selected.length <= 12 && <Legend wrapperStyle={{ fontSize: 10 }} />}
                         <ReferenceLine y={0} stroke="#3a4353" />
                         {chartMarks.closed.map((d) => { const band = getBandRange(chartData.map((x) => x.date), d); return band ? <ReferenceArea key={`closed-${d}`} x1={band.x1} x2={band.x2} fill="#5a6272" fillOpacity={0.28} stroke="none" label={{ value: "休", position: "insideTop", fill: "#c7cbd4", fontSize: 10 }} /> : null; })}
+                        {chartMarks.nodata.map((d) => { const band = getBandRange(chartData.map((x) => x.date), d); return band ? <ReferenceArea key={`nodata-${d}`} x1={band.x1} x2={band.x2} fill="#7a3038" fillOpacity={0.25} stroke="none" label={{ value: "なし", position: "insideTop", fill: "#e5697a", fontSize: 9 }} /> : null; })}
                         {chartMarks.d2.map((d) => <ReferenceLine key={`d2-${d}`} x={d} stroke={DIGIT2_COLOR} strokeDasharray="2 2" strokeOpacity={0.55} label={{ value: "2", position: "top", fill: DIGIT2_COLOR, fontSize: 9 }} />)}
                         {chartMarks.d7.map((d) => <ReferenceLine key={`d7-${d}`} x={d} stroke={DIGIT7_COLOR} strokeDasharray="2 2" strokeOpacity={0.55} label={{ value: "7", position: "top", fill: DIGIT7_COLOR, fontSize: 9 }} />)}
                         {chartMarks.strong.map((x) => <ReferenceLine key={`st-${x.date}`} x={x.date} stroke="#e5484d" strokeDasharray="5 3" strokeWidth={2} label={{ value: "★", position: "top", fill: "#e5484d", fontSize: 10 }} />)}
@@ -2651,7 +2802,7 @@ export default function App() {
                       </LineChart>
                     </ResponsiveContainer>
                   )}
-                  <div style={{ fontSize: 11, color: "#5a6272", marginTop: 6, lineHeight: 1.6 }}>単位：枚（その日の差枚）　★(赤) = 強いイベント　☆(黄) = イベント　🚩(緑) = 準イベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日</div>
+                  <div style={{ fontSize: 11, color: "#5a6272", marginTop: 6, lineHeight: 1.6 }}>単位：枚（その日の差枚）　★(赤) = 強いイベント　☆(黄) = イベント　🚩(緑) = 準イベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日　赤い帯 = データなし</div>
                 </div>
 
                 <div style={{ ...S.card, marginBottom: 0 }}>
