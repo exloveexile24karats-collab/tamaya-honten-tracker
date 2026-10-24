@@ -80,7 +80,18 @@ import { storage } from "./storage";
 //     前日 同じ機種の中で上位10%／下位10%、前日±3000枚以上、前日のG数の±2000G増減、店の直近3日（上位/下位25%）、
 //     機種の直近30日（上位/下位1/3）。バックテスト（ウォークフォワード・全ページ）では
 //     S 51.8%→51.2%・E 32.5%→32.3%（☆〇率）でほぼ変わらず＝台選びへの効き目は小さいという分析結果と一致。
-export const APP_VERSION = "0.4.0";
+// v0.4.1: 10/25のデータ（5/1〜10/24）で見直し。
+//   ①グレードの境目を S≥100 / A≥60 / B≥-10 / C≥-60 / D≥-100 / E に変更（旧 S≥60/A≥30/B≥10/C≥-10/D≥-30）。
+//     バックテストの翌日勝率（全ページ）：旧 S54.8/A42.7/B42.7/C41.4/D38.8/E36.5 → 新 S57.8/A48.5/B42.3/C39.0/D37.6/E33.1。
+//     マイジャグ 新 S61.4〜E29.4、その他ジャグラー 新 S56.1〜E35.0、カバネリ 新 S49.1。
+//   ②喰種・SAO2のピックアップに「参考表示」（点数で勝率の差がほぼ出ていないため。PICKUP_RELIABILITY）。
+//   ③台ごとに「設定っぽさ」（0〜100）と🔥入ってそう・💤見切り。初当たり（機種平均に向けて縮める）・その台のいつもより
+//     粘られたか・差枚の機種内の位置の平均。回転数そのものは「よく座られる台」が毎回同じ（前半→後半の相関0.9）で
+//     設定と関係がないため、その台のいつもの回転数と比べた値を使う。マイジャグで下位1/5はRB 1/418・上位1/5は1/278。
+//     ※この点数でも「どの台に入るか」は予想できなかった（AUC 0.50）。日・機種の見方の材料として表示。
+//   ④今日の見通しに「機種の勢い」（直近30日×0.4・直近3日×0.2）を追加。毎日1位の機種の勝率 55.5%→56.6%、
+//     上位3機種 50.0%→52.1%（ウォークフォワード）。
+export const APP_VERSION = "0.4.1";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -563,8 +574,9 @@ const CAP_NORMAL = 3900; // 通常時G数の信頼度上限（§4-1）
 const CAP_TOTAL = 8000; // 総回転数の信頼度上限
 export const MIN_N = 15;
 export const GRADE_BANDS = [
-  { min: 60, grade: "S" }, { min: 30, grade: "A" }, { min: 10, grade: "B" },
-  { min: -10, grade: "C" }, { min: -30, grade: "D" }, { min: -Infinity, grade: "E" },
+  // v0.4.1：10/25のバックテストで見直し（+100を超えると勝率がそれ以上上がらず、旧A〜Cはほぼ同じ勝率だったため）
+  { min: 100, grade: "S" }, { min: 60, grade: "A" }, { min: -10, grade: "B" },
+  { min: -60, grade: "C" }, { min: -100, grade: "D" }, { min: -Infinity, grade: "E" },
 ];
 export function symbolPointsToGrade(points) {
   return GRADE_BANDS.find((b) => points >= b.min).grade;
@@ -710,6 +722,44 @@ export function buildSymbolContext(pageDays, opts) {
     list.sort((a, b) => a.s - b.s);
     list.forEach((rec, idx) => { rec.rankPct = idx / (list.length - 1); });
   });
+  // v0.4.1：設定っぽさ（初当たり・その台のいつもより粘られたか・差枚の3つを機種の中での位置にして平均。0〜100）
+  //   見切り＝その日いつもより回されず（下位1/3）、差枚が±1000枚の中途半端、初当たりも機種平均以下
+  //   入ってそう＝初当たりも粘られ方も上位1/3、または差枚が機種の上位10%
+  {
+    const byModel = new Map();
+    machines.forEach((m) => m.recs.forEach((rec) => { if (!byModel.has(m.modelKey)) byModel.set(m.modelKey, []); byModel.get(m.modelKey).push({ m, rec }); }));
+    const pctMap = (arr, val) => { const xs = arr.map(val).filter((v) => v !== null && v !== undefined && !Number.isNaN(v)).sort((a, b) => a - b); return (v) => (v === null || v === undefined || Number.isNaN(v) || !xs.length ? null : sortedInsertRank(xs, v)); };
+    byModel.forEach((list) => {
+      let K = 0, G = 0;
+      list.forEach(({ rec }) => { if (rec.g > 0 && rec.bb !== null && rec.bb !== undefined && rec.rb !== null && rec.rb !== undefined) { K += rec.bb + rec.rb; G += rec.g; } });
+      const mrate = G ? K / G : null;
+      list.forEach(({ rec }) => {
+        rec.hitShr = mrate && rec.g > 0 && rec.bb !== null && rec.bb !== undefined && rec.rb !== null && rec.rb !== undefined ? (rec.bb + rec.rb + mrate * 3000) / (rec.g + 3000) / mrate : null;
+      });
+      // その台のいつもの回転数（その日より前の5日以上の平均）と比べた今日
+      const seen = new Set();
+      list.forEach(({ m }) => {
+        if (seen.has(m.key)) return; seen.add(m.key);
+        let sum = 0, n = 0;
+        m.recs.forEach((rec) => { rec.gRel = n >= 5 && rec.g > 0 ? rec.g / (sum / n) : null; if (rec.g > 0) { sum += rec.g; n += 1; } });
+      });
+      const hitP = pctMap(list, (x) => x.rec.hitShr), sP = pctMap(list, (x) => x.rec.s);
+      const byDay = new Map();
+      list.forEach((x) => { if (!byDay.has(x.rec.di)) byDay.set(x.rec.di, []); byDay.get(x.rec.di).push(x); });
+      byDay.forEach((dl) => {
+        const gP = pctMap(dl, (x) => (x.rec.gRel !== null ? x.rec.gRel : null));
+        const gRaw = pctMap(dl, (x) => x.rec.g);
+        dl.forEach(({ rec }) => {
+          if (!(rec.g > 0) || rec.s === null || rec.s === undefined) { rec.setLike = null; return; }
+          const h = hitP(rec.hitShr), gp = rec.gRel !== null ? gP(rec.gRel) : gRaw(rec.g), sp = sP(rec.s);
+          const parts = [h, gp, sp].filter((v) => v !== null);
+          rec.setLike = parts.length >= 2 ? Math.round((parts.reduce((a, b) => a + b, 0) / parts.length) * 100) : null;
+          rec.mikiri = gp !== null && gp <= 1 / 3 && Math.abs(rec.s) <= 1000 && rec.hitShr !== null && rec.hitShr < 1;
+          rec.iri = (h !== null && gp !== null && h >= 2 / 3 && gp >= 2 / 3) || (sp !== null && sp >= 0.9);
+        });
+      });
+    });
+  }
   // v0.4.0：機種ごとの「直近30日の1台平均」の位置（機種の中で下位1/3＝lo・上位1/3＝hi）
   const model30 = new Map();
   {
@@ -1040,6 +1090,12 @@ export function buildStoreLevel(ovrByDate) {
   return { level, l3, fn: (d) => level[d] || null };
 }
 
+// v0.4.1：ピックアップの点数で勝率の差がほぼ出ていない機種（10/25のバックテスト＝前日までのデータで翌日を予想して確かめた結果）
+// 新しいデータで再確認したら書き換える。キーは機種名（照合後）
+export const PICKUP_RELIABILITY = {
+  "L東京喰種": "喰種は点数による勝率の差がほぼ出ていません（10/25時点のバックテストで S 43%〜E 35%、いつも41%。台・日とも予想が当たらない状態）。台選びより、木曜・勇者たまピーなど日の候補を参考にしてください。",
+  "スロット ソードアート・オンラインⅡ": "SAO2は点数による勝率の差が出ていません（10/25時点のバックテストで S〜E すべて34〜38%）。3のつく日・極誓は弱い、1001番は全期間で勝率50%、という分かっていることを参考にしてください。",
+};
 export const SHUYAKU_MIN_N = 7;
 export const SHUYAKU_MIN_RATE = 0.8;
 export const SHUYAKU_MIN_AVG = 1000;
@@ -1106,6 +1162,12 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve }) {
       est += weight * (rate - base);
       parts.push({ label: c.label, rate, days: nd, diff: rate - base });
     });
+    // v0.4.1：機種の勢い（直近30日・直近3日の勝率がいつもより高い/低い）。10/25の検証で係数0.4・0.2が最も当たった
+    const dsAll = [...m.keys()].sort();
+    const recentRate = (k) => { const ks = dsAll.slice(-k); let w = 0, t = 0; ks.forEach((d) => { const x = m.get(d); w += x.wins; t += x.total; }); return ks.length >= Math.min(k, 3) && t ? w / t : null; };
+    const r30 = dsAll.length >= 20 ? recentRate(30) : null, r3 = recentRate(3);
+    if (r30 !== null) { est += 0.4 * (r30 - base); parts.push({ label: "直近30日の勢い", rate: r30, days: Math.min(30, dsAll.length), diff: r30 - base }); }
+    if (r3 !== null) { est += 0.2 * (r3 - base); parts.push({ label: "直近3日", rate: r3, days: Math.min(3, dsAll.length), diff: r3 - base }); }
     // イベント対象機種（3*3など）：過去に対象だった日の成績
     const isTarget = isTargetOn ? isTargetOn(target, k) : false;
     let targetPart = null;
@@ -3242,9 +3304,10 @@ export default function App() {
                     <div style={{ fontSize: 12, color: "#5a6272" }}>この日のデータはまだありません。</div>
                   ) : (
                     <>
+                      <div style={{ fontSize: 11, color: "#8b93a3", marginBottom: 6, lineHeight: 1.6 }}>設定っぽさ（0〜100）＝初当たり・その台のいつもより粘られたか・差枚を機種の中で比べた平均。🔥入ってそう／💤見切り（回されず差枚も中途半端）。マイジャグで確かめると、設定っぽさ下位1/5はRB 1/418・上位1/5は1/278。</div>
                       <div className="scrollbar" style={{ maxHeight: 300, overflow: "auto", marginBottom: 14 }}>
                         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                          <thead><tr><th style={S.th}>台番</th><th style={{ ...S.th, textAlign: "right" }}>差枚</th><th style={{ ...S.th, textAlign: "right" }}>G数</th><th style={{ ...S.th, textAlign: "center" }}>記号</th><th style={{ ...S.th, textAlign: "right" }}>期待度</th></tr></thead>
+                          <thead><tr><th style={S.th}>台番</th><th style={{ ...S.th, textAlign: "right" }}>差枚</th><th style={{ ...S.th, textAlign: "right" }}>G数</th><th style={{ ...S.th, textAlign: "center" }}>記号</th><th style={{ ...S.th, textAlign: "right" }}>期待度</th><th style={{ ...S.th, textAlign: "right" }}>設定っぽさ</th></tr></thead>
                           <tbody>{viewDateList.map(({ m, r }) => (
                             <tr key={m.key} style={{ borderTop: "1px solid #232b37" }}>
                               <td className="mono" style={{ padding: "6px 6px", color: "#c7cbd4" }}>{isMultiModel ? machineLabel(m) : m.no}{r.src === "m" && <span style={{ color: "#bb9af7", fontSize: 10 }}> 代用</span>}</td>
@@ -3252,6 +3315,7 @@ export default function App() {
                               <td className="mono" style={{ padding: "6px 6px", textAlign: "right", color: "#8b93a3" }}>{fmt(r.g)}</td>
                               <td className="mono" style={{ padding: "6px 6px", textAlign: "center", fontWeight: 700, color: SYMBOL_COLORS[r.sym] }}>{r.sym}</td>
                               <td className="mono" style={{ padding: "6px 6px", textAlign: "right", color: r.exp ? fiveBandColor(Math.round(r.exp.score * 100)) : "#5a6272" }}>{r.exp ? Math.round(r.exp.score * 100) : "―"}</td>
+                              <td className="mono" style={{ padding: "6px 6px", textAlign: "right", whiteSpace: "nowrap", color: r.setLike !== null && r.setLike !== undefined ? fiveBandColor(r.setLike) : "#5a6272" }}>{r.iri && <span title="入ってそう">🔥</span>}{r.mikiri && <span title="見切り" style={{ color: "#8b93a3" }}>💤</span>}{r.setLike ?? "―"}</td>
                             </tr>
                           ))}</tbody>
                         </table>
@@ -3317,8 +3381,9 @@ export default function App() {
                     <div style={{ ...S.h, fontSize: 14 }}>{pickTitle}</div>
                     <div style={S.note}>
                       {engine.pick.lastDate}までのデータで予想。過去の「パターンに当てはまった台の翌日☆〇率 − 全体の☆〇率（基準{engine.learned.base !== null ? `${(engine.learned.base * 100).toFixed(1)}%` : "―"}）」を点数にして合計しています。学習済みパターン{engine.learned.weights.size}件（データ{engine.ctx.dates.length}日・サンプル数15未満のパターンは使いません）。
-                      グレード：S≥60 / A≥30 / B≥10 / C≥-10 / D≥-30 / E。
+                      グレード：S≥100 / A≥60 / B≥-10 / C≥-60 / D≥-100 / E（v0.4.1で見直し）。
                     </div>
+                    {(() => { const hit = Object.keys(PICKUP_RELIABILITY).filter((n) => pageNameKeys.has(resolve(n))).map((n) => PICKUP_RELIABILITY[n]); return hit.length ? <div style={{ fontSize: 12, color: "#e8b34c", background: "rgba(232,179,76,0.08)", border: "1px solid #5a4a2a", borderRadius: 6, padding: "7px 9px", marginBottom: 10, lineHeight: 1.6 }}>⚠️ 参考表示：{hit.join(" ")}</div> : null; })()}
                     {engine.learned.weights.size === 0 && <div style={{ fontSize: 12, color: "#e8b34c", marginBottom: 10 }}>データ蓄積中です。サンプル数がそろったパターンから順に点数が付きます（それまでは全台0pt）。</div>}
                     <div className="scrollbar" style={{ maxHeight: 560, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
                       {engine.pick.list.map((p) => {
@@ -3332,7 +3397,7 @@ export default function App() {
                               <span className="mono" style={{ fontWeight: 700, color: "#e8b34c" }}>{machineLabel(m)}</span>
                               {p.targetEvents && p.targetEvents.length > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: "#12161d", background: "#e8b34c", borderRadius: 999, padding: "1px 8px" }}>🎯 {p.targetEvents.join("、")}の対象</span>}
                               <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: p.points >= 0 ? "#9ece6a" : "#e5697a" }}>{p.points >= 0 ? "+" : ""}{p.points.toFixed(1)}pt</span>
-                              <span style={{ fontSize: 11, color: "#5a6272" }}>前日 <span style={{ color: SYMBOL_COLORS[p.lastSym], fontWeight: 700 }}>{p.lastSym}</span>{p.lastExp && <> ・期待度 <span style={{ color: fiveBandColor(Math.round(p.lastExp.score * 100)) }}>{Math.round(p.lastExp.score * 100)}</span></>}</span>
+                              <span style={{ fontSize: 11, color: "#5a6272" }}>前日 <span style={{ color: SYMBOL_COLORS[p.lastSym], fontWeight: 700 }}>{p.lastSym}</span>{p.lastExp && <> ・期待度 <span style={{ color: fiveBandColor(Math.round(p.lastExp.score * 100)) }}>{Math.round(p.lastExp.score * 100)}</span></>}{m && m.recs.length > 0 && m.recs[m.recs.length - 1].setLike != null && <> ・設定っぽさ <span style={{ color: fiveBandColor(m.recs[m.recs.length - 1].setLike) }}>{m.recs[m.recs.length - 1].iri ? "🔥" : m.recs[m.recs.length - 1].mikiri ? "💤" : ""}{m.recs[m.recs.length - 1].setLike}</span></>}</span>
                             </div>
                             {items.length > 0 && (
                               <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 1 }}>
