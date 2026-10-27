@@ -103,7 +103,11 @@ import { storage } from "./storage";
 //   ①今日の見通しに🔄（今週よく回されている）を表示し、見通しに+3.5%（下位は-2.4%）。
 //   ②ピックアップの学習パターン「今週いつもより回されている／いない」を追加（バックテストAUC 0.580→0.581とわずか。
 //     オススメの週は機種の台がまとめて上がる形で、台の順位はつかないため）。
-export const APP_VERSION = "0.4.4";
+// v0.4.5: 店のオススメ機種（1週間ごと・月曜〜日曜）を共通設定で登録できるように（キー slot-week-recommends-v1）。
+//   見通しに⭐（登録週の実績で上乗せ、実績が少ないうちは+5%）、ピックアップに学習パターン「店のオススメ機種」。
+//   共通設定には、その週のデータから見た🔄よく回されている機種をタップで追加できる候補として表示。
+//   🔄の表示に「月曜から○日分」を追加（週の初めほど判定材料が少ないため）。エクスポート／インポートにも追加。
+export const APP_VERSION = "0.4.5";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -122,6 +126,7 @@ export const KEYS = {
   eventTargets: "slot-event-targets-v1", // { イベント名: [機種名...] }（いつも同じ対象機種）
   dateEventTargets: "slot-date-event-targets-v1", // { 日付: { イベント名: [機種名...] } }（その日の対象機種）
   noData: "slot-no-data-days-v1", // [{ date }] 営業していたがデータが取れない日（v0.3.5）
+  weekRec: "slot-week-recommends-v1", // { 週の月曜: [機種名...] } 店のオススメ機種（1週間ごと・v0.4.5）
 };
 export const RAW_PREFIX = "slot-raw-fulltable-v1:week:";
 export const RAW_INDEX = "slot-raw-fulltable-index-v1";
@@ -824,7 +829,7 @@ export function buildSymbolContext(pageDays, opts) {
   const p80 = quantile(readingsForPct, 0.8);
   // 記号（§4-2）：読み取りの階層（p20/p50/p80）× 差枚
   machines.forEach((m) => m.recs.forEach((r) => { r.sym = classifySymbol(r, { p20, p50, p80 }); }));
-  return { dates, gapBefore, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length, model30, storeLevel: o.storeLevel || null, weekPlay: o.weekPlay || null };
+  return { dates, gapBefore, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length, model30, storeLevel: o.storeLevel || null, weekPlay: o.weekPlay || null, weekRec: o.weekRec || null };
 }
 export function classifySymbol(r, p) {
   if (!r.enough || r.reading === null || p.p20 === null || r.s === null || r.s === undefined) return "－";
@@ -933,6 +938,7 @@ export function patternKeysAt(ctx, m, i, target) {
     if (dg >= 2000) add("gUp", "前日のG数が前々日より2000G以上増加");
     else if (dg <= -2000) add("gDown", "前日のG数が前々日より2000G以上減少");
   }
+  if (ctx.weekRec && ctx.weekRec(m.modelKey, target)) add("weekOsusume", "店のオススメ機種（今週・登録）");
   const wp = ctx.weekPlay ? ctx.weekPlay(m.modelKey, target) : null;
   if (wp === "hot") add("weekHot", "今週いつもより回されている機種（オススメっぽい）");
   else if (wp === "cold") add("weekCold", "今週いつもより回されていない機種");
@@ -1188,7 +1194,7 @@ export function shuyakuOf(day, resolve) {
 }
 
 // 見通しの本体。target＝見たい日（その日より前の民レポだけを使う）
-export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekPlay }) {
+export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap }) {
   const dates = Object.keys(ovr || {}).filter((d) => d < target).sort();
   if (dates.length < 10) return null;
   const R = resolve || ((x) => x);
@@ -1223,6 +1229,16 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekP
   const shuyakuCount = {};
   const seenShu = new Set(); // 同じ日に2つのイベント（例：メガンダイ＋8のつく日）があっても1回と数える
   shuyakuHistory.forEach((h) => h.days.forEach((x) => x.list.forEach((s) => { const id = `${x.date}|${s.key}`; if (seenShu.has(id)) return; seenShu.add(id); shuyakuCount[s.key] = (shuyakuCount[s.key] || 0) + 1; })));
+  // v0.4.5：店のオススメ機種（登録）。過去の登録週の成績（その機種のいつもとの差）を測る。少ないうちは+5%（10/28の分析値）
+  const recKeysOf = (d) => new Set(((weekRecMap || {})[weekStartOf2(d)] || []).map(R));
+  let recW = 0, recT = 0, recBase = 0, recDays = 0;
+  const baseOf = {};
+  series.forEach((m, k) => { let w = 0, t = 0; m.forEach((x) => { w += x.wins; t += x.total; }); baseOf[k] = t ? w / t : null; });
+  dates.forEach((d) => { const ks = recKeysOf(d); if (!ks.size) return; ks.forEach((k) => { const x = series.get(k) && series.get(k).get(d); if (x && baseOf[k] !== null) { recW += x.wins; recT += x.total; recBase += baseOf[k] * x.total; recDays += 1; } }); });
+  const recMeasured = recT ? (recW - recBase) / recT : null;
+  const recLift = recMeasured === null ? 0.05 : (recMeasured * recDays + 0.05 * 20) / (recDays + 20);
+  const targetRec = recKeysOf(target);
+  const weekDaysSoFar = dates.filter((d) => d >= weekStartOf2(target) && d < target).length;
   // 機種ごとの見通し
   const lastDate = dates[dates.length - 1];
   const models = [];
@@ -1252,10 +1268,12 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekP
     if (r3 !== null) { est += 0.2 * (r3 - base); parts.push({ label: "直近3日", rate: r3, days: Math.min(3, dsAll.length), diff: r3 - base }); }
     // v0.4.4：今週（月曜から前日まで）いつもより回されているか。10/28の検証で、上位20%の機種は残りの日の勝率がいつもより+3.5%（下位20%は-2.4%）
     let week = null;
+    const isRec = targetRec.has(k);
+    if (isRec) est += recLift;
     if (weekPlay) {
       const lv = weekPlay.level(k, target); const pv = weekPlay.priorOf(k, target);
       if (lv === "hot") est += 0.035; else if (lv === "cold") est -= 0.024;
-      if (pv !== null) week = { level: lv, pct: Math.exp(pv) - 1 };
+      if (pv !== null) week = { level: lv, pct: Math.exp(pv) - 1, days: weekDaysSoFar };
     }
     // イベント対象機種（3*3など）：過去に対象だった日の成績
     const isTarget = isTargetOn ? isTargetOn(target, k) : false;
@@ -1287,7 +1305,7 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekP
         balance = { r, cur, pos, n: xs.length };
       }
     }
-    models.push({ key: k, name: names[k], total: latest.total, base, est: Math.max(0.02, Math.min(0.98, est)), parts, isTarget, targetPart, shuyaku: shuyakuCount[k] || 0, balance, week });
+    models.push({ key: k, name: names[k], total: latest.total, base, est: Math.max(0.02, Math.min(0.98, est)), parts, isTarget, targetPart, shuyaku: shuyakuCount[k] || 0, balance, week, isRec });
   });
   models.sort((a, b) => b.est - a.est);
   // 店の直近3日
@@ -1309,7 +1327,7 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekP
     if (i + 1 < dates.length) { const r2 = ovr[dates[i + 1]].modelRows.find((x) => R(x.name) === R(r.name)); if (r2 && r2.total) { nDay2w += r2.wins || 0; nDay2t += r2.total; } }
   });
   const newMachine = nn >= 3 ? { models: nn, rate: nt ? nw / nt : null, avg: ns / nn, nextRate: nDay2t ? nDay2w / nDay2t : null } : null;
-  return { target, lastDate, events: tEvents, conds: conds.map((c, i) => ({ label: c.label, days: condDays[i].size })), models, shuyakuHistory, store, newMachine };
+  return { rec: { lift: recLift, measured: recMeasured, days: recDays, registered: targetRec.size }, target, lastDate, events: tEvents, conds: conds.map((c, i) => ({ label: c.label, days: condDays[i].size })), models, shuyakuHistory, store, newMachine };
 }
 
 const EVENT_DELIMITER = "、";
@@ -1322,7 +1340,7 @@ function joinNames(list) {
 const KV_DEFAULTS = {
   [KEYS.pages]: [], [KEYS.eventNames]: [], [KEYS.strong]: [], [KEYS.semi]: [], [KEYS.closed]: [],
   [KEYS.dateEvent]: {}, [KEYS.undo]: [], [KEYS.aliases]: {}, [KEYS.noModel]: {}, [KEYS.gtype]: {},
-  [KEYS.eventTargets]: {}, [KEYS.dateEventTargets]: {}, [KEYS.noData]: [],
+  [KEYS.eventTargets]: {}, [KEYS.dateEventTargets]: {}, [KEYS.noData]: [], [KEYS.weekRec]: {},
 };
 const NO_EVENT_LABEL = "イベント無し";
 const DIGIT2_COLOR = "#7dcfff";
@@ -1595,6 +1613,20 @@ export default function App() {
   const gtypeOf = useCallback((mk) => gtypeOfEntry(gtypes[mk]), [gtypes]);
   const storeLevelFn = useMemo(() => buildStoreLevel(ovr).fn, [ovr]);
   const weekPlay = useMemo(() => buildWeekPlay(ovr, resolve), [ovr, resolve]);
+  const weekRecMap = kv[KEYS.weekRec] || KV_DEFAULTS[KEYS.weekRec];
+  const weekRecFn = useCallback((k, d) => (weekRecMap[weekStartOf2(d)] || []).some((n) => resolve(n) === k), [weekRecMap, resolve]);
+  const [recWeekDate, setRecWeekDate] = useState(todayStr());
+  const [recStatus, setRecStatus] = useState(null);
+  const recWeek = weekStartOf2(recWeekDate);
+  const setWeekRec = useCallback(async (w, updater) => {
+    const r = await commitKV(KEYS.weekRec, (prev) => {
+      const next = { ...(prev || {}) };
+      const list = updater(next[w] || []);
+      if (list.length) next[w] = list; else delete next[w];
+      return next;
+    });
+    setRecStatus(r.ok ? { type: "ok", msg: "保存しました。" } : null);
+  }, [commitKV]);
   const profileByKey = useMemo(() => {
     const m = {};
     Object.keys(SETTING_PROFILES).forEach((n) => { m[resolve(n)] = SETTING_PROFILES[n]; });
@@ -1618,6 +1650,16 @@ export default function App() {
     return [...keys].map((k) => ({ key: k, name: displayNameOf[k], count: count[k] || 0 }))
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "ja"));
   }, [allDays, ovrDates, ovr, resolve, displayNameOf]);
+  // この週のデータから見た「よく回されている」機種（その週の、今日までに分かっている日で）
+  const recSuggest = useMemo(() => {
+    const until = addDays(recWeek, 7);
+    const target = until <= todayStr() ? until : addDays(todayStr(), 1);
+    const out = [];
+    const keys = new Set();
+    Object.keys(ovr).forEach((d) => { if (d >= recWeek && d < target) ovr[d].modelRows.forEach((r) => { if (!r.isVariety && r.total >= 3) keys.add(resolve(r.name)); }); });
+    keys.forEach((k) => { const pv = weekPlay.priorOf(k, target); if (pv !== null && weekPlay.hi !== null && pv >= weekPlay.hi) out.push({ key: k, name: displayNameOf[k] || k, pct: Math.exp(pv) - 1 }); });
+    return out.sort((a, b) => b.pct - a.pct).filter((x) => !(weekRecMap[recWeek] || []).some((n) => resolve(n) === x.key));
+  }, [recWeek, ovr, resolve, weekPlay, displayNameOf, weekRecMap]);
   const knownModelNames = useMemo(() => {
     const set = new Set();
     allDays.forEach((d) => d.rows.forEach((r) => set.add(r.em)));
@@ -2053,6 +2095,7 @@ export default function App() {
       modelGTypes: gtypes,
       eventTargets,
       dateEventTargets,
+      weekRecommends: kv[KEYS.weekRec] || {},
     };
     const blob = new Blob([JSON.stringify(obj)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -2077,7 +2120,7 @@ export default function App() {
       const kvPairs = [
         [KEYS.pages, obj.pages], [KEYS.eventNames, obj.eventNames], [KEYS.strong, obj.strongEvents], [KEYS.semi, obj.semiEvents],
         [KEYS.closed, obj.closedDays], [KEYS.noData, obj.noDataDays], [KEYS.dateEvent, obj.dateEventMap], [KEYS.aliases, obj.modelAliases], [KEYS.noModel, obj.noModelMap], [KEYS.gtype, obj.modelGTypes],
-        [KEYS.eventTargets, obj.eventTargets], [KEYS.dateEventTargets, obj.dateEventTargets],
+        [KEYS.eventTargets, obj.eventTargets], [KEYS.dateEventTargets, obj.dateEventTargets], [KEYS.weekRec, obj.weekRecommends],
       ];
       for (const [k, v] of kvPairs) if (v !== undefined) { const r = await commitKV(k, () => v); if (!r.ok) throw new Error(r.error); }
       if (obj.rawFullTable && obj.rawFullTableFormat === "packed-v1") await bulkWriteWeekly("raw", obj.rawFullTable);
@@ -2236,11 +2279,11 @@ export default function App() {
   }, [viewMode, currentPage, pageNameKeys, allDays, resolve, displayNameOf]);
   const engine = useMemo(() => {
     if (!pageDays.length) return null;
-    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet, closedSet, storeLevel: storeLevelFn, weekPlay: weekPlay.level });
+    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet, closedSet, storeLevel: storeLevelFn, weekPlay: weekPlay.level, weekRec: weekRecFn });
     const learned = learnSymbolPatternWeights(ctx);
     const pick = scoreSymbolPickupToday(ctx, learned, closedSet, skipTargetSet);
     return { ctx, learned, pick };
-  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet, storeLevelFn, weekPlay]);
+  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet, storeLevelFn, weekPlay, weekRecFn]);
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
   const machineLabel = (m) => (isMultiModel ? `${m.model} ${m.no}番` : `${m.no}番`);
 
@@ -2486,8 +2529,8 @@ export default function App() {
   const [outlookAll, setOutlookAll] = useState(false);
   const outlook = useMemo(() => {
     if (viewMode !== "overall" || !effOutlookDate) return null;
-    try { return buildOutlook({ ovr, target: effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay }); } catch (e) { return null; }
-  }, [viewMode, ovr, effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay]);
+    try { return buildOutlook({ ovr, target: effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap }); } catch (e) { return null; }
+  }, [viewMode, ovr, effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap]);
   // ---- イベントを選んで過去を見る（v0.2.2）----
   const [evHist, setEvHist] = useState("");
   const allEventNames = useMemo(() => {
@@ -2996,6 +3039,23 @@ export default function App() {
               </div>
 
               <div style={S.card}>
+                <div style={S.h}>⭐ 店のオススメ機種（1週間ごと・月曜から日曜）</div>
+                <div style={S.note}>店で見たその週のオススメ機種を登録します（何機種でも）。見通しに⭐で表示し、ピックアップの学習パターン「店のオススメ機種」にも入ります。日付を選ぶと、その日を含む週（月曜始まり）に登録されます。10/28の分析では、オススメっぽい週の機種は勝率がいつもより+3.5〜5%でした。</div>
+                <input type="date" value={recWeekDate} onChange={(e) => setRecWeekDate(e.target.value || todayStr())} style={{ ...S.input, marginBottom: 6 }} />
+                <div style={{ fontSize: 12, color: "#c7cbd4", marginBottom: 8 }}>{md(recWeek)}（月）〜{md(addDays(recWeek, 6))}（日）の週</div>
+                {recSuggest.length > 0 && (
+                  <div style={{ fontSize: 11, color: "#8b93a3", marginBottom: 8, lineHeight: 1.8 }}>データから見たこの週の🔄よく回されている機種（タップで追加）：{recSuggest.map((x) => <button key={x.key} onClick={() => setWeekRec(recWeek, (l) => addUniqueName(l, x.name))} style={{ ...S.ghost, fontSize: 11, padding: "1px 7px", margin: "2px 4px 2px 0" }}>🔄 {x.name} +{Math.round(x.pct * 100)}%</button>)}</div>
+                )}
+                <ModelChips icon="⭐" options={modelOptions} resolve={resolve} names={weekRecMap[recWeek] || []} onAdd={(n) => setWeekRec(recWeek, (l) => addUniqueName(l, n))} onRemove={(n) => setWeekRec(recWeek, (l) => l.filter((x) => x !== n))} />
+                <Status s={recStatus} />
+                {Object.keys(weekRecMap).filter((w) => (weekRecMap[w] || []).length).sort().reverse().slice(0, 8).map((w) => (
+                  <div key={w} style={{ ...S.row, marginBottom: 4, marginTop: 4, cursor: "pointer" }} onClick={() => setRecWeekDate(w)}>
+                    <span style={{ fontSize: 12 }}><span className="mono">{md(w)}〜{md(addDays(w, 6))}</span>　<span style={{ color: "#f2d24b" }}>⭐ {weekRecMap[w].join("、")}</span></span>
+                  </div>
+                ))}
+              </div>
+
+              <div style={S.card}>
                 <div style={S.h}>📤 エクスポート／インポート</div>
                 <div style={S.note}>全データを1つのJSONファイルに書き出します（バックテスト用にもこのファイルを使います）。インポートは別端末への移行・復元用です。</div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -3060,6 +3120,7 @@ export default function App() {
                       {h.days.length > 8 && <div style={{ fontSize: 11, color: "#5a6272" }}>ほか{h.days.length - 8}回（主役あり{h.days.slice(8).filter((x) => x.list.length).length}回）</div>}
                     </div>
                   ))}
+                  <div style={{ fontSize: 11, color: "#8b93a3", margin: "4px 0 6px", lineHeight: 1.6 }}>⭐店のオススメ：{outlook.rec.registered ? `この週は${outlook.rec.registered}機種を登録済み` : "この週はまだ登録なし（共通設定で登録）"}。見通しに{outlook.rec.lift >= 0 ? "+" : ""}{(outlook.rec.lift * 100).toFixed(1)}%（{outlook.rec.measured === null ? "まだ登録の実績が無いので10/28の分析値+5%" : `登録した週の実績${outlook.rec.measured >= 0 ? "+" : ""}${(outlook.rec.measured * 100).toFixed(1)}%・${outlook.rec.days}機種日を反映`}）。🔄＝今週（月曜から前日まで）いつもより回されている機種（データからの推測、+3.5%）。</div>
                   <div style={{ fontSize: 11, color: "#8b93a3", margin: "4px 0 6px" }}>見通し＝その機種のいつもの勝率に、今日の条件（{outlook.conds.map((c) => `${c.label}${c.days}日`).join("・")}{" "}／🎯対象）で過去どうだったかを日数に応じて足したもの。勝率＝差枚プラスの台の割合。</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     {(outlookAll ? outlook.models : outlook.models.slice(0, 12)).map((m) => {
@@ -3067,12 +3128,13 @@ export default function App() {
                       return (
                         <div key={m.key} style={{ background: "#12161d", border: `1px solid ${d >= 0.08 ? "#4a5a2a" : d <= -0.08 ? "#5a2a33" : "#232b37"}`, borderRadius: 6, padding: "7px 9px" }}>
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
-                            <span>{m.isTarget && <span style={{ color: "#e8b34c" }}>🎯</span>}{m.week && m.week.level === "hot" && <span>🔄</span>}{m.shuyaku > 0 && <span style={{ color: "#f2d24b" }}>👑{m.shuyaku}</span>} {m.name}<span style={{ color: "#5a6272" }}>（{m.total}台）</span></span>
+                            <span>{m.isRec && <span>⭐</span>}{m.isTarget && <span style={{ color: "#e8b34c" }}>🎯</span>}{m.week && m.week.level === "hot" && <span>🔄</span>}{m.shuyaku > 0 && <span style={{ color: "#f2d24b" }}>👑{m.shuyaku}</span>} {m.name}<span style={{ color: "#5a6272" }}>（{m.total}台）</span></span>
                             <span className="mono">見通し <b style={{ color: d >= 0.05 ? "#9ece6a" : d <= -0.05 ? "#e5697a" : "#c7cbd4" }}>{Math.round(m.est * 100)}%</b><span style={{ color: "#5a6272" }}>　いつも{Math.round(m.base * 100)}%</span></span>
                           </div>
                           <div style={{ fontSize: 11, color: "#8b93a3", marginTop: 3, lineHeight: 1.7 }}>
                             {m.parts.map((p) => <span key={p.label} style={{ marginRight: 8, display: "inline-block", color: p.diff >= 0.05 ? "#9ece6a" : p.diff <= -0.05 ? "#e5697a" : "#8b93a3" }}>{p.label} {Math.round(p.rate * 100)}%（{p.days}日）</span>)}
-                            {m.week && m.week.level && <span style={{ marginRight: 8, display: "inline-block", color: m.week.level === "hot" ? "#9ece6a" : "#e5697a" }}>{m.week.level === "hot" ? "🔄今週よく回されている（オススメっぽい）" : "今週あまり回されていない"} {m.week.pct >= 0 ? "+" : ""}{Math.round(m.week.pct * 100)}%</span>}
+                            {m.isRec && <span style={{ marginRight: 8, display: "inline-block", color: "#f2d24b" }}>⭐店のオススメ（今週・登録）</span>}
+                            {m.week && m.week.level && <span style={{ marginRight: 8, display: "inline-block", color: m.week.level === "hot" ? "#9ece6a" : "#e5697a" }}>{m.week.level === "hot" ? "🔄今週よく回されている（オススメっぽい）" : "今週あまり回されていない"} {m.week.pct >= 0 ? "+" : ""}{Math.round(m.week.pct * 100)}%（月曜から{m.week.days}日分）</span>}
                             {m.targetPart && <span style={{ marginRight: 8, display: "inline-block", color: "#e8b34c" }}>🎯対象の日 {Math.round(m.targetPart.rate * 100)}%（{m.targetPart.days}日）</span>}
                             {m.balance && m.balance.pos !== "mid" && <span style={{ display: "inline-block", color: m.balance.pos === "lo" ? "#9ece6a" : "#e5697a" }}>⚖️直近30日が{m.balance.pos === "lo" ? "悪い→戻りやすい" : "良い→締めやすい"}（この機種で相関{m.balance.r.toFixed(2)}）</span>}
                           </div>
