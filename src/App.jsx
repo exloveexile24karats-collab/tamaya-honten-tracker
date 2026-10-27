@@ -117,7 +117,13 @@ import { storage } from "./storage";
 //   （台だけの点数にしても S63〜E31%と同程度。台だけの点数の機種内AUCは0.506）。計算は変えていない。
 // v0.4.8: 設定っぽさの初当たりを、カバネリ・モンキーターンはRBだけで計算（BBはAT中の当たりも入り差枚との相関0.91〜0.93、
 //   RBは0.28〜0.45で初当たりに近い）。SAO2はBBに初当たりとST中のスナイパーチャンスが混ざるため今のまま。
-export const APP_VERSION = "0.4.8";
+// v0.4.9: 別のClaudeの引き継ぎメモv2（10/28）を確認して反映（ばらつき係数cとSAO2の候補は手元のデータでも再現：
+//   c＝カバネリ0.57・喰種0.50・モンキー0.61、SAO2のAUC 0.579）。
+//   ①カバネリ・喰種・モンキーの設定っぽさを「初当たり（RB）のz」と「設定4以上の見込み%」に置き換え（SETTING_Z_PARAMS）。
+//     喰種のRBはCZ回数。民レポの代用データは総回転なので通常時に換算（×ratio）。事前の見込みは強い日20%・普通の日10%（仮）。
+//   ②全体データに「📱 昼の見極め」：機種・G数・初当たり回数から設定4以上の見込みと「見切り候補」をその場で計算。
+//   ③SAO2の追跡：強い日の予想で、前回の強い日に差枚上位1/4だった台に🔍印（ランクは変えない。強い日10回分で確かめる）。
+export const APP_VERSION = "0.4.9";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -639,7 +645,27 @@ export const PRED_GRADE_BANDS = [
 ];
 export const PRED_PTS_WEIGHT = 0.0005;
 // 設定っぽさの初当たりにRBだけを使う機種（BBが出玉と連動する機種）
-export const SETLIKE_RB_ONLY = /カバネリ|モンキーターン/;
+export const SETLIKE_RB_ONLY = /カバネリ|モンキーターン|東京喰種/;
+// v0.4.9：AT機の設定の見込み（引き継ぎメモv2 §3。2026-05-01〜10-26の実測。半年ごとくらいに再計算）
+//   初当たり回数（アナスロのRB）n と通常G数 G から z＝(n−G/base)/√(c·G/base)、設定4（6）以上の見込みは正規近似の尤度比で。
+//   c＝回数の分散÷平均（周期・天井で運だけより規則正しく当たるため1より小さい）。ratio＝通常G÷総回転（民レポの代用データ用）。
+export const SETTING_Z_PARAMS = [
+  { match: /カバネリ/, name: "カバネリ", base: 245.9, c: 0.57, hi4: 207.0, hi6: 188.7, ratio: 0.81, what: "ボーナス初当たり（RB）" },
+  { match: /東京喰種/, name: "喰種", base: 252.7, c: 0.51, hi4: 224.3, hi6: 196.0, ratio: 0.74, what: "CZ回数（RB）" },
+  { match: /モンキーターン/, name: "モンキーターンV", base: 285.1, c: 0.6, hi4: 246.1, hi6: 212.0, ratio: 0.66, what: "AT初当たり（RB）" },
+];
+export function settingZParamsOf(modelName) { return SETTING_Z_PARAMS.find((x) => x.match.test(String(modelName || ""))) || null; }
+export function settingZ(prm, normalG, n, prior = 0.1) {
+  if (!prm || !(normalG > 0) || n === null || n === undefined) return null;
+  const m0 = normalG / prm.base;
+  const z = (n - m0) / Math.sqrt(prm.c * m0);
+  const post = (hi) => {
+    const m1 = normalG / hi;
+    const lr = Math.sqrt(m0 / m1) * Math.exp(-((n - m1) ** 2) / (2 * prm.c * m1) + ((n - m0) ** 2) / (2 * prm.c * m0));
+    return (prior * lr) / (prior * lr + (1 - prior));
+  };
+  return { z, p4: post(prm.hi4), p6: post(prm.hi6), m0 };
+}
 // 日・機種の材料（予想日やその週・店全体のこと）か、台そのものの材料かの区別（表示用）
 export const isDayPattern = (k) => /^(strongDay|dayDigit:|ev:|eventDay|noEvent|wd:|xEv:|evTail:|afterStrong|afterSemi|store3|week|evTarget|evNotTarget|m30)/.test(k);
 export function predToGrade(p) { return PRED_GRADE_BANDS.find((b) => p >= b.min).grade; }
@@ -767,6 +793,8 @@ export function buildSymbolContext(pageDays, opts) {
       const cap = c.gtype === "total" ? CAP_TOTAL : CAP_NORMAL;
       const exp = settingLikelihoodScore(m, c, strong);
       const rec = { di, date: day.date, g: m.g, s: m.s, bb: m.bb, rb: m.rb, src: m.src, reading: exp ? exp.raw : null, exp, enough: !!(m.g && m.g >= cap * 0.25) };
+      const zp = settingZParamsOf(m.model);
+      if (zp && m.g > 0 && m.rb !== null && m.rb !== undefined) rec.sz = settingZ(zp, m.src === "m" ? m.g * zp.ratio : m.g, m.rb, strong ? 0.2 : 0.1);
       if (rec.reading !== null && rec.enough) readingsForPct.push(rec.reading);
       if (!machines.has(m.key)) machines.set(m.key, { key: m.key, no: m.no, model: m.model, modelKey: m.modelKey, recs: [] });
       const mm = machines.get(m.key);
@@ -2318,6 +2346,17 @@ export default function App() {
       if (o) { it.modelEst = o.est; it.pred = o.est + PRED_PTS_WEIGHT * it.points; it.grade = predToGrade(it.pred); } else { it.modelEst = null; it.pred = null; }
     });
     pick.list.sort((a, b) => (b.pred ?? -1) - (a.pred ?? -1) || b.points - a.points || a.no - b.no);
+    // v0.4.9：SAO2の追跡中の候補（引き継ぎメモv2 §2）。強い日の予想で、前回の強い日に機種内で差枚上位1/4だった台に印（ランクは変えない）
+    if (pick.target && isStrong(pick.target)) {
+      const lastStrongDi = (() => { for (let di = ctx.dates.length - 1; di >= 0; di--) if (isStrong(ctx.dates[di])) return di; return -1; })();
+      if (lastStrongDi >= 0) {
+        const byModel = new Map();
+        ctx.machines.forEach((mm) => { if (!/ソードアート/.test(mm.model)) return; const r = mm.recs.find((x) => x.di === lastStrongDi); if (r && r.s !== null && r.s !== undefined) { if (!byModel.has(mm.modelKey)) byModel.set(mm.modelKey, []); byModel.get(mm.modelKey).push({ key: mm.key, s: r.s }); } });
+        const top = new Set();
+        byModel.forEach((l) => { const sorted = [...l].sort((a, b) => b.s - a.s); sorted.slice(0, Math.max(1, Math.round(l.length / 4))).forEach((x) => top.add(x.key)); });
+        pick.list.forEach((it) => { if (top.has(it.key)) it.saoPrevStrongTop = ctx.dates[lastStrongDi]; });
+      }
+    }
     return { ctx, learned, pick };
   }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet, storeLevelFn, weekPlay, weekRecFn, ovr, isTargetOn, resolve, weekRecMap]);
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
@@ -2563,6 +2602,11 @@ export default function App() {
   const defaultOutlookDate = useMemo(() => (ovrDates.length ? nextOpenDate(ovrDates[ovrDates.length - 1], closedSet, noDataSet) : todayStr()), [ovrDates, closedSet, noDataSet]);
   const effOutlookDate = outlookDate || defaultOutlookDate;
   const [outlookAll, setOutlookAll] = useState(false);
+  const [noonModel, setNoonModel] = useState(0);
+  const [noonG, setNoonG] = useState("");
+  const [noonN, setNoonN] = useState("");
+  const [noonTotal, setNoonTotal] = useState(false);
+  const [noonStrong, setNoonStrong] = useState(true);
   const outlook = useMemo(() => {
     if (viewMode !== "overall" || !effOutlookDate) return null;
     try { return buildOutlook({ ovr, target: effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap }); } catch (e) { return null; }
@@ -3186,6 +3230,34 @@ export default function App() {
               )}
             </div>
           )}
+          <div style={S.card}>
+            <div style={S.h}>📱 昼の見極め（AT機の初当たり）</div>
+            <div style={S.note}>打っている途中のG数と初当たり回数を入れると、設定4以上の見込みが出ます。日次データで分かる限界があるので「見切りの根拠」に使ってください（上出来でも50%前後止まり。続行は台の示唆で判断）。回数はアナスロでRBに入る方（カバネリ＝ボーナス初当たり、喰種＝CZ、モンキー＝AT初当たり）。</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+              {SETTING_Z_PARAMS.map((x, i) => <button key={x.name} onClick={() => setNoonModel(i)} style={chipBtn(noonModel === i)}>{x.name}</button>)}
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 8 }}>
+              <input type="number" inputMode="numeric" value={noonG} onChange={(e) => setNoonG(e.target.value)} placeholder="G数" style={{ ...S.input, width: 100 }} />
+              <button onClick={() => setNoonTotal((v) => !v)} style={chipBtn(noonTotal)}>{noonTotal ? "総回転数" : "通常時G数"}</button>
+              <input type="number" inputMode="numeric" value={noonN} onChange={(e) => setNoonN(e.target.value)} placeholder="初当たり回数" style={{ ...S.input, width: 120 }} />
+              <button onClick={() => setNoonStrong((v) => !v)} style={chipBtn(noonStrong)}>{noonStrong ? "強い日（8・2のつく日）" : "普通の日"}</button>
+            </div>
+            {(() => {
+              const prm = SETTING_Z_PARAMS[noonModel]; const g = parseFloat(noonG), n = parseFloat(noonN);
+              if (!(g > 0) || !(n >= 0)) return <div style={{ fontSize: 12, color: "#5a6272" }}>G数と回数を入れてください。</div>;
+              const ng = noonTotal ? g * prm.ratio : g;
+              const r = settingZ(prm, ng, n, noonStrong ? 0.2 : 0.1);
+              const verdict = n <= r.m0 ? { t: "見切り候補（普段以下）", c: "#7aa2f7" } : r.p4 >= 0.5 ? { t: "かなり良い（台の示唆も確認）", c: "#e5484d" } : r.p4 >= 0.3 ? { t: "良い方", c: "#e8b34c" } : { t: "普通（様子見）", c: "#c7cbd4" };
+              return (
+                <div style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: 6, padding: "8px 10px", fontSize: 12, lineHeight: 1.7 }}>
+                  <div>通常時 {Math.round(ng).toLocaleString()}G で {n}回（1/{n > 0 ? Math.round(ng / n) : "―"}）・普段なら {r.m0.toFixed(1)}回（1/{Math.round(prm.base)}）</div>
+                  <div>z <b>{r.z >= 0 ? "+" : ""}{r.z.toFixed(1)}</b>　設定4以上の見込み <b style={{ color: verdict.c }}>{Math.round(r.p4 * 100)}%</b>　設定6相当 {Math.round(r.p6 * 100)}%</div>
+                  <div style={{ color: verdict.c, fontWeight: 700 }}>{verdict.t}</div>
+                  {noonTotal && <div style={{ fontSize: 11, color: "#5a6272" }}>総回転→通常時は×{prm.ratio}（1日平均の比。AT中が長いと実際の通常時はもっと少ない）</div>}
+                </div>
+              );
+            })()}
+          </div>
           {dailyTotals.length > 0 && (
             <div style={S.card}>
               <div style={S.h}>📈 店全体の推移（民レポ）</div>
@@ -3502,7 +3574,7 @@ export default function App() {
                     <div style={{ fontSize: 12, color: "#5a6272" }}>この日のデータはまだありません。</div>
                   ) : (
                     <>
-                      <div style={{ fontSize: 11, color: "#8b93a3", marginBottom: 6, lineHeight: 1.6 }}>設定っぽさ（0〜100）＝初当たり・その台のいつもより粘られたか・差枚を機種の中で比べた平均。🔥入ってそう／💤見切り（回されず差枚も中途半端）。マイジャグで確かめると、設定っぽさ下位1/5はRB 1/418・上位1/5は1/278。</div>
+                      <div style={{ fontSize: 11, color: "#8b93a3", marginBottom: 6, lineHeight: 1.6 }}>カバネリ・喰種・モンキーは「初当たり（RB）が普段より何SD多いか（z）」と設定4以上の見込み（4↑）。zは+1.5で上位約7%、+2で上位2〜3%。それ以外の機種の設定っぽさ（0〜100）＝初当たり・その台のいつもより粘られたか・差枚を機種の中で比べた平均。🔥入ってそう／💤見切り（回されず差枚も中途半端）。マイジャグで確かめると、設定っぽさ下位1/5はRB 1/418・上位1/5は1/278。</div>
                       <div className="scrollbar" style={{ maxHeight: 300, overflow: "auto", marginBottom: 14 }}>
                         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                           <thead><tr><th style={S.th}>台番</th><th style={{ ...S.th, textAlign: "right" }}>差枚</th><th style={{ ...S.th, textAlign: "right" }}>G数</th><th style={{ ...S.th, textAlign: "center" }}>記号</th><th style={{ ...S.th, textAlign: "right" }}>期待度</th><th style={{ ...S.th, textAlign: "right" }}>設定っぽさ</th></tr></thead>
@@ -3513,7 +3585,7 @@ export default function App() {
                               <td className="mono" style={{ padding: "6px 6px", textAlign: "right", color: "#8b93a3" }}>{fmt(r.g)}</td>
                               <td className="mono" style={{ padding: "6px 6px", textAlign: "center", fontWeight: 700, color: SYMBOL_COLORS[r.sym] }}>{r.sym}</td>
                               <td className="mono" style={{ padding: "6px 6px", textAlign: "right", color: r.exp ? fiveBandColor(Math.round(r.exp.score * 100)) : "#5a6272" }}>{r.exp ? Math.round(r.exp.score * 100) : "―"}</td>
-                              <td className="mono" style={{ padding: "6px 6px", textAlign: "right", whiteSpace: "nowrap", color: r.setLike !== null && r.setLike !== undefined ? fiveBandColor(r.setLike) : "#5a6272" }}>{r.iri && <span title="入ってそう">🔥</span>}{r.mikiri && <span title="見切り" style={{ color: "#8b93a3" }}>💤</span>}{r.setLike ?? "―"}</td>
+                              <td className="mono" style={{ padding: "6px 6px", textAlign: "right", whiteSpace: "nowrap", color: r.sz ? (r.sz.z >= 1.5 ? "#e5484d" : r.sz.z >= 0.5 ? "#e8b34c" : r.sz.z <= -0.5 ? "#7aa2f7" : "#c7cbd4") : r.setLike !== null && r.setLike !== undefined ? fiveBandColor(r.setLike) : "#5a6272" }}>{r.sz ? <>{r.sz.z >= 0 ? "+" : ""}{r.sz.z.toFixed(1)}<span style={{ fontSize: 10, color: "#8b93a3" }}> 4↑{Math.round(r.sz.p4 * 100)}%</span></> : <>{r.iri && <span title="入ってそう">🔥</span>}{r.mikiri && <span title="見切り" style={{ color: "#8b93a3" }}>💤</span>}{r.setLike ?? "―"}</>}</td>
                             </tr>
                           ))}</tbody>
                         </table>
@@ -3593,11 +3665,12 @@ export default function App() {
                             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                               <span className="mono" style={{ width: 22, height: 22, lineHeight: "22px", textAlign: "center", borderRadius: "50%", fontWeight: 800, color: "#12161d", background: GRADE_COLORS[p.grade] }}>{p.grade}</span>
                               <span className="mono" style={{ fontWeight: 700, color: "#e8b34c" }}>{machineLabel(m)}</span>
+                              {p.saoPrevStrongTop && <span style={{ fontSize: 11, color: "#bb9af7", border: "1px solid #4a3a6a", borderRadius: 999, padding: "1px 8px" }} title="SAO2だけ前半・後半とも『前回の強い日の上位→次の強い日も良い』向き（AUC 0.58）。まだ確定ではないので追跡中">🔍前回の強い日（{md(p.saoPrevStrongTop)}）上位1/4・追跡中</span>}
                               {p.targetEvents && p.targetEvents.length > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: "#12161d", background: "#e8b34c", borderRadius: 999, padding: "1px 8px" }}>🎯 {p.targetEvents.join("、")}の対象</span>}
                               {p.pred !== null && p.pred !== undefined && <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: "#e7e9ee" }}>予想勝率 {Math.round(p.pred * 100)}%</span>}
                               <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: p.points >= 0 ? "#9ece6a" : "#e5697a" }}>{p.points >= 0 ? "+" : ""}{p.points.toFixed(1)}pt</span>
                               {p.modelEst !== null && p.modelEst !== undefined && <span style={{ fontSize: 11, color: "#5a6272" }}>機種の見通し {Math.round(p.modelEst * 100)}%・台の点数だけなら{p.ptGrade}</span>}
-                              <span style={{ fontSize: 11, color: "#5a6272" }}>前日 <span style={{ color: SYMBOL_COLORS[p.lastSym], fontWeight: 700 }}>{p.lastSym}</span>{p.lastExp && <> ・期待度 <span style={{ color: fiveBandColor(Math.round(p.lastExp.score * 100)) }}>{Math.round(p.lastExp.score * 100)}</span></>}{m && m.recs.length > 0 && m.recs[m.recs.length - 1].setLike != null && <> ・設定っぽさ <span style={{ color: fiveBandColor(m.recs[m.recs.length - 1].setLike) }}>{m.recs[m.recs.length - 1].iri ? "🔥" : m.recs[m.recs.length - 1].mikiri ? "💤" : ""}{m.recs[m.recs.length - 1].setLike}</span></>}</span>
+                              <span style={{ fontSize: 11, color: "#5a6272" }}>前日 <span style={{ color: SYMBOL_COLORS[p.lastSym], fontWeight: 700 }}>{p.lastSym}</span>{p.lastExp && <> ・期待度 <span style={{ color: fiveBandColor(Math.round(p.lastExp.score * 100)) }}>{Math.round(p.lastExp.score * 100)}</span></>}{m && m.recs.length > 0 && m.recs[m.recs.length - 1].sz && <> ・初当たりz <span style={{ color: m.recs[m.recs.length - 1].sz.z >= 1.5 ? "#e5484d" : "#c7cbd4" }}>{m.recs[m.recs.length - 1].sz.z >= 0 ? "+" : ""}{m.recs[m.recs.length - 1].sz.z.toFixed(1)}（4↑{Math.round(m.recs[m.recs.length - 1].sz.p4 * 100)}%）</span></>}{m && m.recs.length > 0 && !m.recs[m.recs.length - 1].sz && m.recs[m.recs.length - 1].setLike != null && <> ・設定っぽさ <span style={{ color: fiveBandColor(m.recs[m.recs.length - 1].setLike) }}>{m.recs[m.recs.length - 1].iri ? "🔥" : m.recs[m.recs.length - 1].mikiri ? "💤" : ""}{m.recs[m.recs.length - 1].setLike}</span></>}</span>
                             </div>
                             {items.length > 0 && (
                               <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 1 }}>
