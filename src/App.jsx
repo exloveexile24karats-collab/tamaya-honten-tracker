@@ -115,7 +115,9 @@ import { storage } from "./storage";
 //   「前日」＝データの最後の日、「予想日」＝予想する日にそろえ、理由に[日]（日・機種の材料）／[台]（台の材料）を付けた。
 //   日の材料が重なって点数が膨らむ件は、予想勝率のランクでは機種の見通しが主で、台の点数は×0.05%なので影響が小さい
 //   （台だけの点数にしても S63〜E31%と同程度。台だけの点数の機種内AUCは0.506）。計算は変えていない。
-export const APP_VERSION = "0.4.7";
+// v0.4.8: 設定っぽさの初当たりを、カバネリ・モンキーターンはRBだけで計算（BBはAT中の当たりも入り差枚との相関0.91〜0.93、
+//   RBは0.28〜0.45で初当たりに近い）。SAO2はBBに初当たりとST中のスナイパーチャンスが混ざるため今のまま。
+export const APP_VERSION = "0.4.8";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -636,6 +638,8 @@ export const PRED_GRADE_BANDS = [
   { min: 0.39, grade: "C" }, { min: 0.31, grade: "D" }, { min: -Infinity, grade: "E" },
 ];
 export const PRED_PTS_WEIGHT = 0.0005;
+// 設定っぽさの初当たりにRBだけを使う機種（BBが出玉と連動する機種）
+export const SETLIKE_RB_ONLY = /カバネリ|モンキーターン/;
 // 日・機種の材料（予想日やその週・店全体のこと）か、台そのものの材料かの区別（表示用）
 export const isDayPattern = (k) => /^(strongDay|dayDigit:|ev:|eventDay|noEvent|wd:|xEv:|evTail:|afterStrong|afterSemi|store3|week|evTarget|evNotTarget|m30)/.test(k);
 export function predToGrade(p) { return PRED_GRADE_BANDS.find((b) => p >= b.min).grade; }
@@ -791,11 +795,14 @@ export function buildSymbolContext(pageDays, opts) {
     machines.forEach((m) => m.recs.forEach((rec) => { if (!byModel.has(m.modelKey)) byModel.set(m.modelKey, []); byModel.get(m.modelKey).push({ m, rec }); }));
     const pctMap = (arr, val) => { const xs = arr.map(val).filter((v) => v !== null && v !== undefined && !Number.isNaN(v)).sort((a, b) => a - b); return (v) => (v === null || v === undefined || Number.isNaN(v) || !xs.length ? null : sortedInsertRank(xs, v)); };
     byModel.forEach((list) => {
+      // v0.4.8：カバネリ・モンキーターンはBBにAT中の当たりが入り出玉と連動する（差枚との相関0.9）ため、初当たりに近いRBだけを使う
+      const rbOnly = SETLIKE_RB_ONLY.test(String(list[0].m.model || ""));
+      const hitsOf = (rec) => (rbOnly ? rec.rb : rec.bb + rec.rb);
       let K = 0, G = 0;
-      list.forEach(({ rec }) => { if (rec.g > 0 && rec.bb !== null && rec.bb !== undefined && rec.rb !== null && rec.rb !== undefined) { K += rec.bb + rec.rb; G += rec.g; } });
+      list.forEach(({ rec }) => { if (rec.g > 0 && rec.bb !== null && rec.bb !== undefined && rec.rb !== null && rec.rb !== undefined) { K += hitsOf(rec); G += rec.g; } });
       const mrate = G ? K / G : null;
       list.forEach(({ rec }) => {
-        rec.hitShr = mrate && rec.g > 0 && rec.bb !== null && rec.bb !== undefined && rec.rb !== null && rec.rb !== undefined ? (rec.bb + rec.rb + mrate * 3000) / (rec.g + 3000) / mrate : null;
+        rec.hitShr = mrate && rec.g > 0 && rec.bb !== null && rec.bb !== undefined && rec.rb !== null && rec.rb !== undefined ? (hitsOf(rec) + mrate * 3000) / (rec.g + 3000) / mrate : null;
       });
       // その台のいつもの回転数（その日より前の5日以上の平均）と比べた今日
       const seen = new Set();
