@@ -111,7 +111,11 @@ import { storage } from "./storage";
 //   バックテスト（6/12〜10/26・ウォークフォワード）：全体 S61/A47/B44/C41/D38/E32%（台の点数だけ S56/A46/B42/C39/D37/E33%）。
 //   マイジャグ S63〜E29%、その他ジャグラー S59〜E33%。喰種・SAO2はSが付かない（今の材料では勝ちやすいと言えないため）。
 //   並び順も予想勝率の順。台の点数（pt）と「台の点数だけならのランク」も残して表示。
-export const APP_VERSION = "0.4.6";
+// v0.4.7: ピックアップの理由の言葉を直した（「当日」「翌日」が同じ予想日を指していて分かりにくかったため）。
+//   「前日」＝データの最後の日、「予想日」＝予想する日にそろえ、理由に[日]（日・機種の材料）／[台]（台の材料）を付けた。
+//   日の材料が重なって点数が膨らむ件は、予想勝率のランクでは機種の見通しが主で、台の点数は×0.05%なので影響が小さい
+//   （台だけの点数にしても S63〜E31%と同程度。台だけの点数の機種内AUCは0.506）。計算は変えていない。
+export const APP_VERSION = "0.4.7";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -632,6 +636,8 @@ export const PRED_GRADE_BANDS = [
   { min: 0.39, grade: "C" }, { min: 0.31, grade: "D" }, { min: -Infinity, grade: "E" },
 ];
 export const PRED_PTS_WEIGHT = 0.0005;
+// 日・機種の材料（予想日やその週・店全体のこと）か、台そのものの材料かの区別（表示用）
+export const isDayPattern = (k) => /^(strongDay|dayDigit:|ev:|eventDay|noEvent|wd:|xEv:|evTail:|afterStrong|afterSemi|store3|week|evTarget|evNotTarget|m30)/.test(k);
 export function predToGrade(p) { return PRED_GRADE_BANDS.find((b) => p >= b.min).grade; }
 export function symbolPointsToGrade(points) {
   return GRADE_BANDS.find((b) => points >= b.min).grade;
@@ -877,12 +883,12 @@ export function patternKeysAt(ctx, m, i, target) {
   // 末尾
   const tail = m.no % 10;
   const tdig = parseInt(target.slice(8, 10), 10) % 10;
-  if (tail === tdig) add(`tailMatch:${s0}`, `台番末尾＝日付末尾 × 前日${s0}`);
-  add(`tail${tail}:${s0}`, `台番末尾${tail} × 前日${s0}`);
+  if (tail === tdig) add(`tailMatch:${s0}`, `台番末尾＝予想日の日付末尾 ＋ 前日${s0}`);
+  add(`tail${tail}:${s0}`, `台番末尾${tail} ＋ 前日${s0}`);
   // 予想日のイベント
   const tEvents = ctx.eventsOn(target);
-  if (s0 === "×") tEvents.forEach((E) => add(`xEv:${E}`, `前日× × 翌日「${E}」`));
-  if (s0 === "×") for (let N = 4; N <= 7; N++) if (isGood(sym(i - N))) add(`xAgo${N}`, `前日× × ${N}日前☆〇`);
+  if (s0 === "×") tEvents.forEach((E) => add(`xEv:${E}`, `前日× ＋ 予想日が「${E}」`));
+  if (s0 === "×") for (let N = 4; N <= 7; N++) if (isGood(sym(i - N))) add(`xAgo${N}`, `前日× ＋ ${N}日前☆〇`);
   // 差枚の足（記録ベース）
   const trail = (k, endOffset = 0) => {
     const end = i - endOffset;
@@ -904,26 +910,26 @@ export function patternKeysAt(ctx, m, i, target) {
   const prev10 = trail(10, 1);
   if (prev10 !== null && prev10 <= -5000 && r[i].s !== null && r[i].s > 0) add("dipUp", "凹み上げ（10日-5000以下→前日プラス）");
   // イベント翌日
-  if (ctx.isStrong(d)) add("afterStrong", "強いイベント翌日");
-  if (ctx.isSemi(d)) add("afterSemi", "準イベント翌日");
+  if (ctx.isStrong(d)) add("afterStrong", "前日が強いイベント");
+  if (ctx.isSemi(d)) add("afterSemi", "前日が準イベント");
   // 予想日の属性
-  add(`dayDigit:${tdig}`, `日付末尾${tdig}`);
+  add(`dayDigit:${tdig}`, `予想日の日付末尾${tdig}`);
   if (tEvents.length) {
-    add("eventDay", "イベント当日");
+    add("eventDay", "予想日がイベント日");
     tEvents.forEach((E) => {
-      add(`ev:${E}`, `イベント「${E}」当日`);
-      if (tail === tdig) add(`evTail:${E}`, `「${E}」× 台番末尾一致`);
+      add(`ev:${E}`, `予想日がイベント「${E}」`);
+      if (tail === tdig) add(`evTail:${E}`, `予想日が「${E}」＋ 台番末尾＝日付末尾`);
     });
-  } else add("noEvent", "通常日（イベント無し）");
-  if (ctx.isStrong(target)) add("strongDay", "強いイベント当日");
+  } else add("noEvent", "予想日がイベント無し");
+  if (ctx.isStrong(target)) add("strongDay", "予想日が強いイベント");
   // イベント対象機種（v0.2.0）
   const tgMap = ctx.targetsOn ? ctx.targetsOn(target) : new Map();
   if (tgMap.size) {
     const hitEvents = [...tgMap.entries()].filter(([, set]) => set.has(m.modelKey)).map(([E]) => E);
     if (hitEvents.length) {
-      add("evTarget", "イベント対象機種（予想日）");
-      hitEvents.forEach((E) => add(`evTarget:${E}`, `「${E}」の対象機種`));
-    } else add("evNotTarget", "対象機種があるイベントで対象外");
+      add("evTarget", "予想日のイベント対象機種");
+      hitEvents.forEach((E) => add(`evTarget:${E}`, `予想日の「${E}」の対象機種`));
+    } else add("evNotTarget", "予想日は対象機種があるイベントで対象外");
   }
   // 自己平均比ローテーション（好調）
   if (i >= 9) {
@@ -950,10 +956,10 @@ export function patternKeysAt(ctx, m, i, target) {
     if (dg >= 2000) add("gUp", "前日のG数が前々日より2000G以上増加");
     else if (dg <= -2000) add("gDown", "前日のG数が前々日より2000G以上減少");
   }
-  if (ctx.weekRec && ctx.weekRec(m.modelKey, target)) add("weekOsusume", "店のオススメ機種（今週・登録）");
+  if (ctx.weekRec && ctx.weekRec(m.modelKey, target)) add("weekOsusume", "予想日の週の店のオススメ機種（登録）");
   const wp = ctx.weekPlay ? ctx.weekPlay(m.modelKey, target) : null;
-  if (wp === "hot") add("weekHot", "今週いつもより回されている機種（オススメっぽい）");
-  else if (wp === "cold") add("weekCold", "今週いつもより回されていない機種");
+  if (wp === "hot") add("weekHot", "予想日の週にいつもより回されている機種（オススメっぽい）");
+  else if (wp === "cold") add("weekCold", "予想日の週にいつもより回されていない機種");
   const st = ctx.storeLevel ? ctx.storeLevel(d) : null;
   if (st === "hi") add("store3hi", "店の直近3日が出ている（上位25%）");
   else if (st === "lo") add("store3lo", "店の直近3日が出ていない（下位25%）");
@@ -962,13 +968,13 @@ export function patternKeysAt(ctx, m, i, target) {
   if (m30v === "lo") add("m30lo", "機種の直近30日が悪い（下位1/3）");
   else if (m30v === "hi") add("m30hi", "機種の直近30日が良い（上位1/3）");
   // 曜日
-  add(`wd:${weekdayOf(target)}`, `${WD[weekdayOf(target)]}曜日`);
+  add(`wd:${weekdayOf(target)}`, `予想日が${WD[weekdayOf(target)]}曜日`);
   // 月に☆〇 → 翌日（2通りの解釈を両方実装：今月の☆〇回数／月曜の☆〇）
   const ym = d.slice(0, 7);
   let cnt = 0;
   for (let j = i; j >= 0 && r[j].date.startsWith(ym); j--) if (isGood(r[j].sym)) cnt += 1;
   add(`month:${Math.min(cnt, 2)}`, `今月の☆〇 ${cnt >= 2 ? "2回以上" : `${cnt}回`}`);
-  if (weekdayOf(d) === 1 && isGood(s0)) add("monGood", "月曜☆〇 → 翌日");
+  if (weekdayOf(d) === 1 && isGood(s0)) add("monGood", "前日（月曜）が☆〇");
   // 台番号固定・台ごとの持続性
   add(`fixed:${m.key}`, `台番号固定（${m.no}番）`, "fixed");
   add(`persist:${m.key}:${isGood(s0) ? 1 : 0}`, `台の持続性（前日${isGood(s0) ? "☆〇" : "☆〇以外"}）⚠️低信頼`, "persist");
@@ -3565,8 +3571,8 @@ export default function App() {
                   <div style={{ ...S.card, marginBottom: 0 }}>
                     <div style={{ ...S.h, fontSize: 14 }}>{pickTitle}</div>
                     <div style={S.note}>
-                      {engine.pick.lastDate}までのデータで予想。過去の「パターンに当てはまった台の翌日☆〇率 − 全体の☆〇率（基準{engine.learned.base !== null ? `${(engine.learned.base * 100).toFixed(1)}%` : "―"}）」を点数にして合計しています。学習済みパターン{engine.learned.weights.size}件（データ{engine.ctx.dates.length}日・サンプル数15未満のパターンは使いません）。
-                      ランクは「予想勝率」＝今日の機種の見通し（全体データの🔮と同じ）＋台の点数×0.05%で付けます：S≥62% / A≥50% / B≥44% / C≥39% / D≥31% / E（v0.4.6。バックテストで全体 S61%〜E32%）。機種の見通しが出ない時は台の点数だけ（S≥100 / A≥60 / B≥-10 / C≥-60 / D≥-100）。
+                      {engine.pick.lastDate}までのデータで予想。過去の「パターンに当てはまった台の、予想日（データの次の営業日）の☆〇率 − 全体の☆〇率（基準{engine.learned.base !== null ? `${(engine.learned.base * 100).toFixed(1)}%` : "―"}）」を点数にして合計しています。学習済みパターン{engine.learned.weights.size}件（データ{engine.ctx.dates.length}日・サンプル数15未満のパターンは使いません）。
+                      「前日」＝データの最後の日、「予想日」＝予想する日。[日]＝その日・機種の材料（同じ日の台は全部同じ）、[台]＝その台の材料。ランクは「予想勝率」＝今日の機種の見通し（全体データの🔮と同じ）＋台の点数×0.05%で付けます：S≥62% / A≥50% / B≥44% / C≥39% / D≥31% / E（v0.4.6。バックテストで全体 S61%〜E32%）。機種の見通しが出ない時は台の点数だけ（S≥100 / A≥60 / B≥-10 / C≥-60 / D≥-100）。
                     </div>
                     {(() => { const hit = Object.keys(PICKUP_RELIABILITY).filter((n) => pageNameKeys.has(resolve(n))).map((n) => PICKUP_RELIABILITY[n]); return hit.length ? <div style={{ fontSize: 12, color: "#e8b34c", background: "rgba(232,179,76,0.08)", border: "1px solid #5a4a2a", borderRadius: 6, padding: "7px 9px", marginBottom: 10, lineHeight: 1.6 }}>⚠️ 参考表示：{hit.join(" ")}</div> : null; })()}
                     {engine.learned.weights.size === 0 && <div style={{ fontSize: 12, color: "#e8b34c", marginBottom: 10 }}>データ蓄積中です。サンプル数がそろったパターンから順に点数が付きます（それまでは全台0pt）。</div>}
@@ -3590,7 +3596,7 @@ export default function App() {
                               <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 1 }}>
                                 {items.map((it) => (
                                   <div key={it.key} className="mono" style={{ fontSize: 11, display: "flex", justifyContent: "space-between", gap: 8, color: "#8b93a3" }}>
-                                    <span>{it.label}<span style={{ color: "#5a6272" }}>：翌日☆〇 {(it.rate * 100).toFixed(1)}%（n={it.n}）</span></span>
+                                    <span><span style={{ color: isDayPattern(it.key) ? "#7aa2f7" : "#e8b34c", marginRight: 3 }}>{isDayPattern(it.key) ? "[日]" : "[台]"}</span>{it.label}<span style={{ color: "#5a6272" }}>：過去この条件の予想日の☆〇率 {(it.rate * 100).toFixed(1)}%（n={it.n}）</span></span>
                                     <span style={{ color: it.points >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700, whiteSpace: "nowrap" }}>{it.points >= 0 ? "+" : ""}{it.points.toFixed(1)}</span>
                                   </div>
                                 ))}
@@ -3645,7 +3651,7 @@ export default function App() {
                     <div style={S.note}>点数の大きい順。n＝過去に当てはまった回数。⚠️は信頼度の低い項目です。</div>
                     <div className="scrollbar" style={{ maxHeight: 360, overflowY: "auto" }}>
                       <table style={{ borderCollapse: "collapse", fontSize: 11, width: "100%" }}>
-                        <thead><tr><th style={S.th}>パターン</th><th style={{ ...S.th, textAlign: "right" }}>n</th><th style={{ ...S.th, textAlign: "right" }}>翌日☆〇</th><th style={{ ...S.th, textAlign: "right" }}>点数</th></tr></thead>
+                        <thead><tr><th style={S.th}>パターン</th><th style={{ ...S.th, textAlign: "right" }}>n</th><th style={{ ...S.th, textAlign: "right" }}>予想日の☆〇率</th><th style={{ ...S.th, textAlign: "right" }}>点数</th></tr></thead>
                         <tbody>{[...engine.learned.weights.values()].sort((a, b) => Math.abs(b.points) - Math.abs(a.points)).map((w) => (
                           <tr key={w.key}>
                             <td style={{ ...S.td, whiteSpace: "normal" }}>{w.label}</td>
