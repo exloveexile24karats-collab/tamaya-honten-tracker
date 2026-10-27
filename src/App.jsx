@@ -131,7 +131,8 @@ import { storage } from "./storage";
 //   ②強い日（8・2）は北斗・吉宗に💪（強い日に初当たりが良くなるAT機。北斗+6.2%・吉宗+5.2%、前半後半とも同じ向き）。
 // v0.4.11: 全体データに「🎨 スプレッドシートに色付け」。全ページのピックアップのランク（台番・ランク・予想勝率・機種）をタブ区切りで書き出し、
 //   スプレッドシートの「ランク」タブに貼って Apps Script（SHEET_COLOR_SCRIPT）で配置図の台番のマスに色だけつける（S赤・Aオレンジ・B黄・C緑・D水色・E灰）。
-export const APP_VERSION = "0.4.11";
+// v0.4.12: 「🎨 スプレッドシートに色付け」を共通設定の一番上に移動（ロック中でも使える。書き出すだけでデータは変えないため）。
+export const APP_VERSION = "0.4.12";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -1524,8 +1525,8 @@ const RANGE_OPTIONS = [
   { key: 60, label: "60日足" }, { key: "all", label: "全期間" },
 ];
 const SYMBOL_COLORS = { "☆": "#e5484d", "〇": "#f2d24b", "▽": "#9ece6a", "□": "#7aa2f7", "×": "#5a6272", "－": "#2f3644" };
-// v0.4.11：スプレッドシートの配置図にランクの色をつける Apps Script（全体データの「🎨 スプレッドシートに色付け」からコピー）
-export const SHEET_COLOR_SCRIPT = "/**\n * 玉屋本店トラッカー → 台番の配置図に色をつける（Google Apps Script）\n * 使い方\n *   1) アプリの「📊 全体データ」→「🎨 スプレッドシートに色付け」で「ランクをコピー」\n *   2) スプレッドシートに「ランク」というタブを作り、A1 に貼り付け（毎回、前の分に上書き）\n *   3) メニュー「🎨 玉屋」→「ランクの色をつける」\n * 配置図の「数字だけのマス」で、台番がランク表にあるマスの背景色だけを変えます。\n * 行・列は増やしません。罫線・文字・太字はそのまま。台番以外のマス（My、喰種 などの文字）は触りません。\n */\nconst LAYOUT_SHEET = '';          // 配置図のタブ名。空なら「ランク」以外で一番左のタブ\nconst RANK_SHEET = 'ランク';      // アプリの書き出しを貼るタブ\nconst COLORS = {                  // ランクの色（好みで変更可）\n  S: '#ff6b6b', // 赤\n  A: '#ffa94d', // オレンジ\n  B: '#ffe066', // 黄色\n  C: '#8ce99a', // 緑\n  D: '#a5d8ff', // 水色\n  E: '#ced4da', // 灰色\n};\nconst RESET_COLOR = '#ffffff';    // ランク表に無い台番のマスの色（前回の色を消す）。消したくなければ null\nconst MIN_NO = 100, MAX_NO = 9999; // 台番とみなす数字の範囲\n\nfunction onOpen() {\n  SpreadsheetApp.getUi().createMenu('🎨 玉屋')\n    .addItem('ランクの色をつける', 'colorByRank')\n    .addItem('色を消す（台番のマスだけ）', 'clearRankColors')\n    .addToUi();\n}\n\nfunction layoutSheet_() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  if (LAYOUT_SHEET) return ss.getSheetByName(LAYOUT_SHEET);\n  return ss.getSheets().find(function (s) { return s.getName() !== RANK_SHEET; });\n}\n\nfunction readRanks_() {\n  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RANK_SHEET);\n  if (!sh) throw new Error('「' + RANK_SHEET + '」タブがありません。作ってアプリの書き出しを貼ってください。');\n  const vals = sh.getDataRange().getValues();\n  const map = {};\n  vals.forEach(function (r) {\n    const no = parseInt(String(r[0]).trim(), 10);\n    const g = String(r[1]).trim().toUpperCase();\n    if (no && COLORS[g]) map[no] = g;\n  });\n  return map;\n}\n\nfunction isNo_(v) {\n  const t = String(v).trim();\n  if (!/^\\d+$/.test(t)) return null;\n  const n = parseInt(t, 10);\n  return n >= MIN_NO && n <= MAX_NO ? n : null;\n}\n\nfunction paint_(ranks) {\n  const sh = layoutSheet_();\n  const rg = sh.getDataRange();\n  const vals = rg.getValues();\n  const bgs = rg.getBackgrounds();\n  let hit = 0, reset = 0;\n  for (let i = 0; i < vals.length; i++) {\n    for (let j = 0; j < vals[i].length; j++) {\n      const no = isNo_(vals[i][j]);\n      if (no === null) continue;\n      const g = ranks ? ranks[no] : null;\n      if (g) { bgs[i][j] = COLORS[g]; hit++; }\n      else if (RESET_COLOR !== null) { bgs[i][j] = RESET_COLOR; reset++; }\n    }\n  }\n  rg.setBackgrounds(bgs);\n  return { sheet: sh.getName(), hit: hit, reset: reset };\n}\n\nfunction colorByRank() {\n  const ranks = readRanks_();\n  const n = Object.keys(ranks).length;\n  if (!n) { SpreadsheetApp.getUi().alert('「' + RANK_SHEET + '」にランクが見つかりません（A列＝台番、B列＝S〜E）。'); return; }\n  const r = paint_(ranks);\n  SpreadsheetApp.getActiveSpreadsheet().toast('「' + r.sheet + '」の ' + r.hit + ' マスに色をつけました（ランク表 ' + n + ' 台）', '🎨 玉屋', 5);\n}\n\nfunction clearRankColors() {\n  const r = paint_(null);\n  SpreadsheetApp.getActiveSpreadsheet().toast('「' + r.sheet + '」の台番 ' + r.reset + ' マスの色を消しました', '🎨 玉屋', 5);\n}\n";
+// v0.4.11：スプレッドシートの配置図にランクの色をつける Apps Script（共通設定の「🎨 スプレッドシートに色付け」からコピー）
+export const SHEET_COLOR_SCRIPT = "/**\n * 玉屋本店トラッカー → 台番の配置図に色をつける（Google Apps Script）\n * 使い方\n *   1) アプリの「🔧 共通設定」→「🎨 スプレッドシートに色付け」で「ランクをコピー」\n *   2) スプレッドシートに「ランク」というタブを作り、A1 に貼り付け（毎回、前の分に上書き）\n *   3) メニュー「🎨 玉屋」→「ランクの色をつける」\n * 配置図の「数字だけのマス」で、台番がランク表にあるマスの背景色だけを変えます。\n * 行・列は増やしません。罫線・文字・太字はそのまま。台番以外のマス（My、喰種 などの文字）は触りません。\n */\nconst LAYOUT_SHEET = '';          // 配置図のタブ名。空なら「ランク」以外で一番左のタブ\nconst RANK_SHEET = 'ランク';      // アプリの書き出しを貼るタブ\nconst COLORS = {                  // ランクの色（好みで変更可）\n  S: '#ff6b6b', // 赤\n  A: '#ffa94d', // オレンジ\n  B: '#ffe066', // 黄色\n  C: '#8ce99a', // 緑\n  D: '#a5d8ff', // 水色\n  E: '#ced4da', // 灰色\n};\nconst RESET_COLOR = '#ffffff';    // ランク表に無い台番のマスの色（前回の色を消す）。消したくなければ null\nconst MIN_NO = 100, MAX_NO = 9999; // 台番とみなす数字の範囲\n\nfunction onOpen() {\n  SpreadsheetApp.getUi().createMenu('🎨 玉屋')\n    .addItem('ランクの色をつける', 'colorByRank')\n    .addItem('色を消す（台番のマスだけ）', 'clearRankColors')\n    .addToUi();\n}\n\nfunction layoutSheet_() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  if (LAYOUT_SHEET) return ss.getSheetByName(LAYOUT_SHEET);\n  return ss.getSheets().find(function (s) { return s.getName() !== RANK_SHEET; });\n}\n\nfunction readRanks_() {\n  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RANK_SHEET);\n  if (!sh) throw new Error('「' + RANK_SHEET + '」タブがありません。作ってアプリの書き出しを貼ってください。');\n  const vals = sh.getDataRange().getValues();\n  const map = {};\n  vals.forEach(function (r) {\n    const no = parseInt(String(r[0]).trim(), 10);\n    const g = String(r[1]).trim().toUpperCase();\n    if (no && COLORS[g]) map[no] = g;\n  });\n  return map;\n}\n\nfunction isNo_(v) {\n  const t = String(v).trim();\n  if (!/^\\d+$/.test(t)) return null;\n  const n = parseInt(t, 10);\n  return n >= MIN_NO && n <= MAX_NO ? n : null;\n}\n\nfunction paint_(ranks) {\n  const sh = layoutSheet_();\n  const rg = sh.getDataRange();\n  const vals = rg.getValues();\n  const bgs = rg.getBackgrounds();\n  let hit = 0, reset = 0;\n  for (let i = 0; i < vals.length; i++) {\n    for (let j = 0; j < vals[i].length; j++) {\n      const no = isNo_(vals[i][j]);\n      if (no === null) continue;\n      const g = ranks ? ranks[no] : null;\n      if (g) { bgs[i][j] = COLORS[g]; hit++; }\n      else if (RESET_COLOR !== null) { bgs[i][j] = RESET_COLOR; reset++; }\n    }\n  }\n  rg.setBackgrounds(bgs);\n  return { sheet: sh.getName(), hit: hit, reset: reset };\n}\n\nfunction colorByRank() {\n  const ranks = readRanks_();\n  const n = Object.keys(ranks).length;\n  if (!n) { SpreadsheetApp.getUi().alert('「' + RANK_SHEET + '」にランクが見つかりません（A列＝台番、B列＝S〜E）。'); return; }\n  const r = paint_(ranks);\n  SpreadsheetApp.getActiveSpreadsheet().toast('「' + r.sheet + '」の ' + r.hit + ' マスに色をつけました（ランク表 ' + n + ' 台）', '🎨 玉屋', 5);\n}\n\nfunction clearRankColors() {\n  const r = paint_(null);\n  SpreadsheetApp.getActiveSpreadsheet().toast('「' + r.sheet + '」の台番 ' + r.reset + ' マスの色を消しました', '🎨 玉屋', 5);\n}\n";
 export const SHEET_COLOR_NAMES = { S: "赤", A: "オレンジ", B: "黄", C: "緑", D: "水色", E: "灰" };
 const GRADE_COLORS = { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#e5697a" };
 const PALETTE = ["#e8b34c", "#4fd1c5", "#e5697a", "#7aa2f7", "#9ece6a", "#bb9af7", "#f6a04d", "#5fd3bc", "#e0af68", "#7dcfff"];
@@ -2982,6 +2983,24 @@ export default function App() {
       {/* =================================================================== 共通設定 */}
       {viewMode === "common" && (
         <div style={{ maxWidth: 820 }}>
+          {pages.length > 0 && rawDates.length > 0 && (
+            <div style={S.card}>
+              <div style={S.h}>🎨 スプレッドシートに色付け（ピックアップのランク）</div>
+              <div style={S.note}>全ページのピックアップのランク（台番・ランク）を書き出します。スプレッドシートの「ランク」タブのA1に貼り、メニュー「🎨 玉屋 → ランクの色をつける」で、配置図の台番のマスに色だけつきます（行・列は増やしません）。色：{Object.entries(SHEET_COLOR_NAMES).map(([g, c]) => `${g}${c}`).join("・")}。初回だけ、拡張機能 → Apps Script にスクリプトを貼って保存してください。</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "8px 0" }}>
+                <button disabled={rankBusy} onClick={() => { setRankBusy(true); setTimeout(buildRankExport, 30); }} style={chipBtn(false)}>{rankBusy ? "作成中…" : "① ランクを作る"}</button>
+                {rankExport && <button onClick={() => copyText(rankExport.text, "ランク")} style={chipBtn(true)}>② ランクをコピー</button>}
+                <button onClick={() => copyText(SHEET_COLOR_SCRIPT, "スクリプト")} style={{ ...S.ghost }}>スクリプトをコピー（初回だけ）</button>
+              </div>
+              {rankCopyMsg && <div style={{ fontSize: 12, color: "#9ece6a", marginBottom: 6 }}>{rankCopyMsg}</div>}
+              {rankExport && (
+                <div>
+                  <div style={{ fontSize: 12, color: "#c7cbd4", marginBottom: 6 }}>予想日 {rankExport.target}：{rankExport.n}台（{["S", "A", "B", "C", "D", "E"].filter((g) => rankExport.count[g]).map((g) => <span key={g} style={{ color: GRADE_COLORS[g], marginRight: 6 }}>{g}{rankExport.count[g]}</span>)}）</div>
+                  <textarea readOnly value={rankExport.text} onFocus={(e) => e.target.select()} style={{ width: "100%", boxSizing: "border-box", height: 90, fontSize: 11, background: "#12161d", color: "#c7cbd4", border: "1px solid #2a323f", borderRadius: 6, fontFamily: "monospace" }} />
+                </div>
+              )}
+            </div>
+          )}
           {!unlocked ? (
             <div style={S.card}>
               <div style={{ ...S.h, display: "flex", alignItems: "center", gap: 6 }}><Lock size={14} /> ロック中です</div>
@@ -3317,24 +3336,6 @@ export default function App() {
             <div style={S.card}>
               <div style={S.h}>まだデータがありません</div>
               <div style={S.note}>「🔧 共通設定」で暗証番号を解除し、民レポとアナスロを貼り付けてください。機種ごとのページは「ページ追加」で作り、正式名称（機種名）を登録すると自動でデータが入ります。</div>
-            </div>
-          )}
-          {pages.length > 0 && rawDates.length > 0 && (
-            <div style={S.card}>
-              <div style={S.h}>🎨 スプレッドシートに色付け（ピックアップのランク）</div>
-              <div style={S.note}>全ページのピックアップのランク（台番・ランク）を書き出します。スプレッドシートの「ランク」タブのA1に貼り、メニュー「🎨 玉屋 → ランクの色をつける」で、配置図の台番のマスに色だけつきます（行・列は増やしません）。色：{Object.entries(SHEET_COLOR_NAMES).map(([g, c]) => `${g}${c}`).join("・")}。初回だけ、拡張機能 → Apps Script にスクリプトを貼って保存してください。</div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "8px 0" }}>
-                <button disabled={rankBusy} onClick={() => { setRankBusy(true); setTimeout(buildRankExport, 30); }} style={chipBtn(false)}>{rankBusy ? "作成中…" : "① ランクを作る"}</button>
-                {rankExport && <button onClick={() => copyText(rankExport.text, "ランク")} style={chipBtn(true)}>② ランクをコピー</button>}
-                <button onClick={() => copyText(SHEET_COLOR_SCRIPT, "スクリプト")} style={{ ...S.ghost }}>スクリプトをコピー（初回だけ）</button>
-              </div>
-              {rankCopyMsg && <div style={{ fontSize: 12, color: "#9ece6a", marginBottom: 6 }}>{rankCopyMsg}</div>}
-              {rankExport && (
-                <div>
-                  <div style={{ fontSize: 12, color: "#c7cbd4", marginBottom: 6 }}>予想日 {rankExport.target}：{rankExport.n}台（{["S", "A", "B", "C", "D", "E"].filter((g) => rankExport.count[g]).map((g) => <span key={g} style={{ color: GRADE_COLORS[g], marginRight: 6 }}>{g}{rankExport.count[g]}</span>)}）</div>
-                  <textarea readOnly value={rankExport.text} onFocus={(e) => e.target.select()} style={{ width: "100%", boxSizing: "border-box", height: 90, fontSize: 11, background: "#12161d", color: "#c7cbd4", border: "1px solid #2a323f", borderRadius: 6, fontFamily: "monospace" }} />
-                </div>
-              )}
             </div>
           )}
           {ovrDates.length >= 10 && (
