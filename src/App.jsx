@@ -91,7 +91,10 @@ import { storage } from "./storage";
 //     ※この点数でも「どの台に入るか」は予想できなかった（AUC 0.50）。日・機種の見方の材料として表示。
 //   ④今日の見通しに「機種の勢い」（直近30日×0.4・直近3日×0.2）を追加。毎日1位の機種の勝率 55.5%→56.6%、
 //     上位3機種 50.0%→52.1%（ウォークフォワード）。
-export const APP_VERSION = "0.4.1";
+// v0.4.2: 【不具合修正】アナスロのエラーで「差枚はあるがG数が空」の台（10/23は72台）を、③個別台で埋められなかった
+//   （アナスロ登録済みとみなして保存を飛ばしていた）。G数が空の台は全部0の台と同じく個別台で置き換える。
+//   アナスロ保存時にG数が空の台があれば、機種ごとの台数と「③個別台で埋めて」という警告を出す。
+export const APP_VERSION = "0.4.2";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -272,6 +275,9 @@ export function parseOverallSummary(text) {
 // 「平均」行は除外。G数は機種により「通常時」か「総回転数」か違う（同じ日の民レポと比べて自動判定）。
 // アナスロで全部0（G数・差枚・BB・RB）の台。終日動かなかった台（稼働なし）と、障害などのデータ欠けの両方がある。
 // v0.3.9〜0.3.11で数字なし（null）として保存した台も同じ扱い。
+// v0.4.2：アナスロのエラーで「差枚はあるがG数が空」の台。個別台（民レポ）で埋められるようにする
+export const isNoGRow = (r) => r.src !== "m" && (r.g === null || r.g === undefined) && r.s !== null && r.s !== undefined;
+export const isFillableRow = (r) => isBlankRow(r) || isNoGRow(r);
 export const isBlankRow = (r) => r.src !== "m" && ((r.g === null && r.s === null) || (!r.g && !r.s && !r.bb && !r.rb));
 const asIdle = (r) => ({ ...r, g: 0, s: 0, bb: 0, rb: 0, idle: true });
 const asMissing = (r) => ({ ...r, g: null, s: null, bb: null, rb: null, missing: true });
@@ -1650,18 +1656,24 @@ export default function App() {
     }
     setAnaDup(null);
     const existing = rawRef.current[anaDate] ? unpackDay(rawRef.current[anaDate]) : [];
-    const anaNos = new Set(rows.filter((r) => !isBlankRow({ ...r, src: "a" })).map((r) => r.no)); // 数字があるアナスロの台（全部0の台は個別台で埋められる）
+    const anaNos = new Set(rows.filter((r) => !isFillableRow({ ...r, src: "a" })).map((r) => r.no)); // 数字があるアナスロの台（全部0・G数が空の台は個別台で埋められる）
     const keptManual = existing.filter((r) => r.src === "m" && !anaNos.has(r.no)); // アナスロに無い・欠けている台の代用データは残す
     const keptNos = new Set(keptManual.map((r) => r.no));
     const replaced = existing.filter((r) => r.src === "m" && anaNos.has(r.no)).length;
     const all = [...rows.filter((r) => !keptNos.has(r.no)).map((r) => ({ ...r, src: "a" })), ...keptManual];
     const blankCount = rows.filter((r) => isBlankRow({ ...r, src: "a" }) && !keptNos.has(r.no)).length;
+    const noGRows = rows.filter((r) => isNoGRow({ ...r, src: "a" }) && !keptNos.has(r.no));
     setBusy(true);
     const res = await writeWeekly("raw", anaDate, packDay(all));
     setBusy(false);
     if (!res.ok) { setAnaStatus({ type: "error", msg: `保存に失敗しました：${res.error}` }); return; }
     let msg = `${anaDate} のアナスロを保存しました（${rows.length}台${replaced ? `・個別台の代用${replaced}台を上書き` : ""}${keptNos.size ? `・欠けている${keptNos.size}台は個別台の代用データを使用` : ""}）。`;
     if (blankCount) msg += blankSummary(anaDate);
+    if (noGRows.length) {
+      const byModel = {};
+      noGRows.forEach((r) => { byModel[r.m] = (byModel[r.m] || 0) + 1; });
+      msg += `\n⚠️ G数が空の台が${noGRows.length}台あります（アナスロのエラー）：${Object.entries(byModel).map(([m, n]) => `${m} ${n}台`).join("、")}。このままだと記号・期待度が出ないので、民レポの機種ページの表を③個別台に貼って埋めてください。`;
+    }
     const rec = await autoReconcile(anaDate);
     if (rec) msg += reconcileSummary(rec);
     const dw = driftWarning(anaDate);
@@ -1679,13 +1691,13 @@ export default function App() {
     if (!parsed.rows.length) { setKbStatus({ type: "error", msg: "台番号の行を読み取れませんでした。" }); return; }
     if (closedSet.has(kbDate)) { setKbStatus({ type: "error", msg: `${kbDate} は店休日として登録されています。` }); return; }
     const existing = rawRef.current[kbDate] ? unpackDay(rawRef.current[kbDate]) : [];
-    const anaNos = new Set(existing.filter((r) => r.src !== "m" && !isBlankRow(r)).map((r) => r.no)); // 全部0（稼働なし・欠け）のアナスロの台は個別台で埋められる
+    const anaNos = new Set(existing.filter((r) => r.src !== "m" && !isFillableRow(r)).map((r) => r.no)); // 全部0（稼働なし・欠け）・G数が空のアナスロの台は個別台で埋められる
     const newNos = new Set(parsed.rows.map((r) => r.no));
     const toAdd = parsed.rows.filter((r) => !anaNos.has(r.no));
     const skipped = parsed.rows.length - toAdd.length;
     const addNos = new Set(toAdd.map((r) => r.no));
     // 同じ台番号の古い代用データと、欠けていたアナスロの行（数字なし）は、今回の個別台データに置き換える
-    const kept = existing.filter((r) => !(addNos.has(r.no) && (r.src === "m" || isBlankRow(r))) && !(r.src === "m" && newNos.has(r.no)));
+    const kept = existing.filter((r) => !(addNos.has(r.no) && (r.src === "m" || isFillableRow(r))) && !(r.src === "m" && newNos.has(r.no)));
     const all = [...kept, ...toAdd.map((r) => ({ m: model, no: r.no, g: r.g, s: r.s, bb: r.bb, rb: r.rb, src: "m" }))];
     setBusy(true);
     let res = { ok: true };
@@ -1697,7 +1709,7 @@ export default function App() {
     const res0 = makeResolver(kvRef.current[KEYS.aliases]);
     const learnedMap = {};
     parsed.rows.forEach((r) => {
-      const a = existing.find((x) => x.no === r.no && x.src !== "m" && !isBlankRow(x));
+      const a = existing.find((x) => x.no === r.no && x.src !== "m" && !isBlankRow(x)); // G数が空の台も差枚で同じ台か確かめられる
       if (!a || res0(a.m) === res0(model)) return;
       const same = a.s === r.s || Math.abs((a.s ?? 0) - (r.s ?? 0)) <= Math.max(30, Math.abs(r.s ?? 0) * 0.03);
       if (same) learnedMap[r.no] = { model, anasloName: a.m, since: kbDate };
@@ -2794,6 +2806,7 @@ export default function App() {
                           <span style={{ marginLeft: 6, color: rows.length - man ? "#9ece6a" : "#e5697a" }}>アナスロ{rows.length - man ? "〇" : "未"}</span>
                           {man > 0 && <span style={{ marginLeft: 6, color: "#bb9af7" }}>代用{man}台</span>}
                           {(() => { const miss = rows.some(isBlankRow) ? classifyBlankRows(rows.map((x) => ({ ...x, em: effectiveModelName(x, noModel) })), ovr[d], resolve).filter((x) => x.missing).length : 0; return miss ? <span style={{ marginLeft: 6, color: "#e8b34c" }}>アナスロ欠け{miss}台</span> : null; })()}
+                          {(() => { const ng = rows.filter(isNoGRow).length; return ng ? <span style={{ marginLeft: 6, color: "#e8b34c" }}>G数なし{ng}台</span> : null; })()}
                           {ndBadge}
                           {driftChecks && driftChecks[d] && (driftChecks[d].level === "bad" || driftChecks[d].level === "warn") && <span style={{ marginLeft: 6, color: driftChecks[d].level === "bad" ? "#e5697a" : "#e8b34c", fontWeight: 700 }}>⚠ずれ</span>}
                         </span>
