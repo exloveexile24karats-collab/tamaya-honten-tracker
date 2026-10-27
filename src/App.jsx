@@ -94,7 +94,9 @@ import { storage } from "./storage";
 // v0.4.2: 【不具合修正】アナスロのエラーで「差枚はあるがG数が空」の台（10/23は72台）を、③個別台で埋められなかった
 //   （アナスロ登録済みとみなして保存を飛ばしていた）。G数が空の台は全部0の台と同じく個別台で置き換える。
 //   アナスロ保存時にG数が空の台があれば、機種ごとの台数と「③個別台で埋めて」という警告を出す。
-export const APP_VERSION = "0.4.2";
+// v0.4.3: ③個別台で、1台だけの機種（バラエティ）のページの形（「617番台」＋機種・差枚・G数・出率＋BB・RB）も読めるように。
+//   何台分続けて貼ってもよく、台ごとに機種名を持つ。
+export const APP_VERSION = "0.4.3";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -336,10 +338,32 @@ export function parseAnaslo(text) {
 export function parseMinRepoIndividual(text) {
   let model = null;
   const rows = [];
+  // v0.4.3：1台だけの機種（バラエティ）のページの形にも対応
+  //   617番台 / 機種 差枚 G数 出率 / 機種名 差枚 G数 出率 / BB RB 合成 BB率 RB率 / BB RB …（何台分続けて貼ってもよい）
+  let single = null; // { no, step, row }
+  const flushSingle = () => { if (single && single.row) rows.push(single.row); single = null; };
   for (const raw of String(text || "").split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
     const cols = raw.split("\t").map((c) => c.trim());
+    const ban = line.match(/^(\d+)\s*番台$/);
+    if (ban) { flushSingle(); single = { no: parseInt(ban[1], 10), step: "head", row: null }; continue; }
+    if (single) {
+      if (cols[0] === "機種") { single.step = "main"; continue; }
+      if (cols[0] === "BB" && cols[1] === "RB") { single.step = "bonus"; continue; }
+      if (single.step === "main" && cols.length >= 3) {
+        const name = cols[0];
+        single.row = { no: single.no, m: name, s: parseIntLoose(cols[1]), g: parseIntLoose(cols[2]), shutsu: parsePct(cols[3]), bb: null, rb: null };
+        if (!model) model = name;
+        continue;
+      }
+      if (single.step === "bonus" && single.row && cols.length >= 2) {
+        single.row.bb = parseIntLoose(cols[0]); single.row.rb = parseIntLoose(cols[1]);
+        flushSingle();
+        continue;
+      }
+      continue;
+    }
     if (cols.length < 6) {
       const m = line.match(/^(.*?)[\s　]*データ一覧$/);
       if (m && !model) model = m[1].trim();
@@ -350,6 +374,7 @@ export function parseMinRepoIndividual(text) {
     if (no === null) continue;
     rows.push({ no, s: parseIntLoose(cols[1]), g: parseIntLoose(cols[2]), shutsu: parsePct(cols[3]), bb: parseIntLoose(cols[4]), rb: parseIntLoose(cols[5]) });
   }
+  flushSingle();
   return { model, rows };
 }
 
@@ -1698,7 +1723,7 @@ export default function App() {
     const addNos = new Set(toAdd.map((r) => r.no));
     // 同じ台番号の古い代用データと、欠けていたアナスロの行（数字なし）は、今回の個別台データに置き換える
     const kept = existing.filter((r) => !(addNos.has(r.no) && (r.src === "m" || isFillableRow(r))) && !(r.src === "m" && newNos.has(r.no)));
-    const all = [...kept, ...toAdd.map((r) => ({ m: model, no: r.no, g: r.g, s: r.s, bb: r.bb, rb: r.rb, src: "m" }))];
+    const all = [...kept, ...toAdd.map((r) => ({ m: r.m || model, no: r.no, g: r.g, s: r.s, bb: r.bb, rb: r.rb, src: "m" }))];
     setBusy(true);
     let res = { ok: true };
     if (toAdd.length) res = await writeWeekly("raw", kbDate, packDay(all));
@@ -1710,13 +1735,15 @@ export default function App() {
     const learnedMap = {};
     parsed.rows.forEach((r) => {
       const a = existing.find((x) => x.no === r.no && x.src !== "m" && !isBlankRow(x)); // G数が空の台も差枚で同じ台か確かめられる
-      if (!a || res0(a.m) === res0(model)) return;
+      if (!a || res0(a.m) === res0(r.m || model)) return;
       const same = a.s === r.s || Math.abs((a.s ?? 0) - (r.s ?? 0)) <= Math.max(30, Math.abs(r.s ?? 0) * 0.03);
-      if (same) learnedMap[r.no] = { model, anasloName: a.m, since: kbDate };
+      if (same) learnedMap[r.no] = { model: r.m || model, anasloName: a.m, since: kbDate };
     });
     if (Object.keys(learnedMap).length) await commitKV(KEYS.noModel, (prev) => ({ ...prev, ...learnedMap }));
     setBusy(false);
-    let msg = toAdd.length ? `${kbDate}「${model}」${toAdd.length}台分を代用データとして保存しました（後でアナスロが入ると自動で上書き）。` : `${kbDate} はアナスロ登録済みのため、代用データは保存していません。`;
+    const label = toAdd.some((r) => r.m) ? toAdd.map((r) => `${r.no}番 ${r.m || model}`).join("・") : `「${model}」`;
+    const skippedInfo = parsed.rows.filter((r) => anaNos.has(r.no)).slice(0, 5).map((r) => { const a = existing.find((x) => x.no === r.no && x.src !== "m"); return a ? `${r.no}番（アナスロ：G${fmt(a.g)}・差枚${fmtSigned(a.s)}）` : `${r.no}番`; }).join("、");
+    let msg = toAdd.length ? `${kbDate} ${label}${toAdd.some((r) => r.m) ? " " : ""}${toAdd.length}台分を代用データとして保存しました（後でアナスロが入ると自動で上書き）。` : `${kbDate} はアナスロに数字が入っているため、代用データは保存していません：${skippedInfo}`;
     if (skipped && toAdd.length) msg += `\n${skipped}台はアナスロ登録済みのため保存していません。`;
     if (toAdd.length) msg += await clearNoDataOn(kbDate);
     if (Object.keys(learnedMap).length) msg += `\n台番号${Object.keys(learnedMap).join("・")}を「${model}」として覚えました（アナスロでは「${Object.values(learnedMap)[0].anasloName}」と表示されている台）。`;
@@ -2678,7 +2705,7 @@ export default function App() {
                   <input type="date" value={kbDate} onChange={(e) => setKbDate(e.target.value)} style={S.input} />
                   <input list="model-names" value={kbModel} onChange={(e) => setKbModel(e.target.value)} placeholder="機種名（表の上の行が無い時だけ）" style={{ ...S.input, flex: "1 1 200px" }} />
                 </div>
-                {parseMinRepoIndividual(kbText).model && <div style={{ fontSize: 11, color: "#9ece6a", marginBottom: 8 }}>読み取った機種名：{parseMinRepoIndividual(kbText).model}</div>}
+                {(() => { const pr = parseMinRepoIndividual(kbText); if (!pr.model) return null; const singles = pr.rows.filter((r) => r.m); return <div style={{ fontSize: 11, color: "#9ece6a", marginBottom: 8 }}>{singles.length ? `読み取った台：${singles.map((r) => `${r.no}番 ${r.m}（差枚${fmtSigned(r.s)}・G${fmt(r.g)}・BB${r.bb ?? "-"}・RB${r.rb ?? "-"}）`).join("、")}` : `読み取った機種名：${pr.model}（${pr.rows.length}台）`}</div>; })()}
                 {closedNotice(kbDate)}
                 <textarea className="scrollbar" rows={6} disabled={closedSet.has(kbDate)} value={kbText} onChange={(e) => setKbText(e.target.value)} placeholder={"○○ データ一覧\n台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n…"} style={{ ...S.textarea, ...lockedArea(kbDate) }} />
                 <button disabled={busy || closedSet.has(kbDate)} onClick={handleSaveIndividual} style={{ ...S.btn("#bb9af7"), width: "100%", opacity: busy ? 0.6 : 1, ...lockedArea(kbDate) }}>{busy ? "保存中..." : "個別台データを保存"}</button>
