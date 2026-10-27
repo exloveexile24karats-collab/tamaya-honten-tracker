@@ -107,7 +107,11 @@ import { storage } from "./storage";
 //   見通しに⭐（登録週の実績で上乗せ、実績が少ないうちは+5%）、ピックアップに学習パターン「店のオススメ機種」。
 //   共通設定には、その週のデータから見た🔄よく回されている機種をタップで追加できる候補として表示。
 //   🔄の表示に「月曜から○日分」を追加（週の初めほど判定材料が少ないため）。エクスポート／インポートにも追加。
-export const APP_VERSION = "0.4.5";
+// v0.4.6: ピックアップのランクを「予想勝率」（機種の今日の見通し＋台の点数×0.0005）で付けるように。
+//   バックテスト（6/12〜10/26・ウォークフォワード）：全体 S61/A47/B44/C41/D38/E32%（台の点数だけ S56/A46/B42/C39/D37/E33%）。
+//   マイジャグ S63〜E29%、その他ジャグラー S59〜E33%。喰種・SAO2はSが付かない（今の材料では勝ちやすいと言えないため）。
+//   並び順も予想勝率の順。台の点数（pt）と「台の点数だけならのランク」も残して表示。
+export const APP_VERSION = "0.4.6";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -621,6 +625,14 @@ export const GRADE_BANDS = [
   { min: 100, grade: "S" }, { min: 60, grade: "A" }, { min: -10, grade: "B" },
   { min: -60, grade: "C" }, { min: -100, grade: "D" }, { min: -Infinity, grade: "E" },
 ];
+// v0.4.6：ピックアップのランクを「予想勝率」で付ける（機種の今日の見通し＋台の点数×0.0005）。
+//   境目は5/23〜10/26のバックテストの分布（15/15/20/20/15/15%）から。全体で S61%〜E32%（台の点数だけだと S56%〜E33%）。
+export const PRED_GRADE_BANDS = [
+  { min: 0.62, grade: "S" }, { min: 0.50, grade: "A" }, { min: 0.44, grade: "B" },
+  { min: 0.39, grade: "C" }, { min: 0.31, grade: "D" }, { min: -Infinity, grade: "E" },
+];
+export const PRED_PTS_WEIGHT = 0.0005;
+export function predToGrade(p) { return PRED_GRADE_BANDS.find((b) => p >= b.min).grade; }
 export function symbolPointsToGrade(points) {
   return GRADE_BANDS.find((b) => points >= b.min).grade;
 }
@@ -2282,8 +2294,19 @@ export default function App() {
     const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet, closedSet, storeLevel: storeLevelFn, weekPlay: weekPlay.level, weekRec: weekRecFn });
     const learned = learnSymbolPatternWeights(ctx);
     const pick = scoreSymbolPickupToday(ctx, learned, closedSet, skipTargetSet);
+    // v0.4.6：予想勝率（機種の見通し＋台の点数）でランク付け
+    let ol = null;
+    try { if (pick.target) ol = buildOutlook({ ovr, target: pick.target, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap }); } catch (e) { ol = null; }
+    const estOf = new Map(ol ? ol.models.map((x) => [x.key, x]) : []);
+    pick.list.forEach((it) => {
+      const mk = ctx.machines.get(it.key) ? ctx.machines.get(it.key).modelKey : null;
+      const o = mk ? estOf.get(mk) : null;
+      it.ptGrade = it.grade;
+      if (o) { it.modelEst = o.est; it.pred = o.est + PRED_PTS_WEIGHT * it.points; it.grade = predToGrade(it.pred); } else { it.modelEst = null; it.pred = null; }
+    });
+    pick.list.sort((a, b) => (b.pred ?? -1) - (a.pred ?? -1) || b.points - a.points || a.no - b.no);
     return { ctx, learned, pick };
-  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet, storeLevelFn, weekPlay, weekRecFn]);
+  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet, storeLevelFn, weekPlay, weekRecFn, ovr, isTargetOn, resolve, weekRecMap]);
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
   const machineLabel = (m) => (isMultiModel ? `${m.model} ${m.no}番` : `${m.no}番`);
 
@@ -3543,7 +3566,7 @@ export default function App() {
                     <div style={{ ...S.h, fontSize: 14 }}>{pickTitle}</div>
                     <div style={S.note}>
                       {engine.pick.lastDate}までのデータで予想。過去の「パターンに当てはまった台の翌日☆〇率 − 全体の☆〇率（基準{engine.learned.base !== null ? `${(engine.learned.base * 100).toFixed(1)}%` : "―"}）」を点数にして合計しています。学習済みパターン{engine.learned.weights.size}件（データ{engine.ctx.dates.length}日・サンプル数15未満のパターンは使いません）。
-                      グレード：S≥100 / A≥60 / B≥-10 / C≥-60 / D≥-100 / E（v0.4.1で見直し）。
+                      ランクは「予想勝率」＝今日の機種の見通し（全体データの🔮と同じ）＋台の点数×0.05%で付けます：S≥62% / A≥50% / B≥44% / C≥39% / D≥31% / E（v0.4.6。バックテストで全体 S61%〜E32%）。機種の見通しが出ない時は台の点数だけ（S≥100 / A≥60 / B≥-10 / C≥-60 / D≥-100）。
                     </div>
                     {(() => { const hit = Object.keys(PICKUP_RELIABILITY).filter((n) => pageNameKeys.has(resolve(n))).map((n) => PICKUP_RELIABILITY[n]); return hit.length ? <div style={{ fontSize: 12, color: "#e8b34c", background: "rgba(232,179,76,0.08)", border: "1px solid #5a4a2a", borderRadius: 6, padding: "7px 9px", marginBottom: 10, lineHeight: 1.6 }}>⚠️ 参考表示：{hit.join(" ")}</div> : null; })()}
                     {engine.learned.weights.size === 0 && <div style={{ fontSize: 12, color: "#e8b34c", marginBottom: 10 }}>データ蓄積中です。サンプル数がそろったパターンから順に点数が付きます（それまでは全台0pt）。</div>}
@@ -3558,7 +3581,9 @@ export default function App() {
                               <span className="mono" style={{ width: 22, height: 22, lineHeight: "22px", textAlign: "center", borderRadius: "50%", fontWeight: 800, color: "#12161d", background: GRADE_COLORS[p.grade] }}>{p.grade}</span>
                               <span className="mono" style={{ fontWeight: 700, color: "#e8b34c" }}>{machineLabel(m)}</span>
                               {p.targetEvents && p.targetEvents.length > 0 && <span style={{ fontSize: 11, fontWeight: 700, color: "#12161d", background: "#e8b34c", borderRadius: 999, padding: "1px 8px" }}>🎯 {p.targetEvents.join("、")}の対象</span>}
+                              {p.pred !== null && p.pred !== undefined && <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: "#e7e9ee" }}>予想勝率 {Math.round(p.pred * 100)}%</span>}
                               <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: p.points >= 0 ? "#9ece6a" : "#e5697a" }}>{p.points >= 0 ? "+" : ""}{p.points.toFixed(1)}pt</span>
+                              {p.modelEst !== null && p.modelEst !== undefined && <span style={{ fontSize: 11, color: "#5a6272" }}>機種の見通し {Math.round(p.modelEst * 100)}%・台の点数だけなら{p.ptGrade}</span>}
                               <span style={{ fontSize: 11, color: "#5a6272" }}>前日 <span style={{ color: SYMBOL_COLORS[p.lastSym], fontWeight: 700 }}>{p.lastSym}</span>{p.lastExp && <> ・期待度 <span style={{ color: fiveBandColor(Math.round(p.lastExp.score * 100)) }}>{Math.round(p.lastExp.score * 100)}</span></>}{m && m.recs.length > 0 && m.recs[m.recs.length - 1].setLike != null && <> ・設定っぽさ <span style={{ color: fiveBandColor(m.recs[m.recs.length - 1].setLike) }}>{m.recs[m.recs.length - 1].iri ? "🔥" : m.recs[m.recs.length - 1].mikiri ? "💤" : ""}{m.recs[m.recs.length - 1].setLike}</span></>}</span>
                             </div>
                             {items.length > 0 && (
