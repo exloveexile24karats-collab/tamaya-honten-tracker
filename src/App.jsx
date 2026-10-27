@@ -96,7 +96,14 @@ import { storage } from "./storage";
 //   アナスロ保存時にG数が空の台があれば、機種ごとの台数と「③個別台で埋めて」という警告を出す。
 // v0.4.3: ③個別台で、1台だけの機種（バラエティ）のページの形（「617番台」＋機種・差枚・G数・出率＋BB・RB）も読めるように。
 //   何台分続けて貼ってもよく、台ごとに機種名を持つ。
-export const APP_VERSION = "0.4.3";
+// v0.4.4: 店が1週間ごと（月曜切り替え）にオススメ機種を変えている形をデータで確認したので反映。
+//   「週の回され方」＝その週の月曜から前日までの、機種の平均G÷店全体の平均G（機種のいつもと日の全体を差し引く）。
+//   同じ機種・同じ週の中の似かたは月曜始まりが最大（回され方0.40・平均差枚0.08、ばらばらなら0.02）。
+//   月火で上位20%の機種は水〜日の勝率がいつもより+3.5%（下位20%は-2.4%、前半後半とも同じ。区切りを土曜にすると差は消える）。
+//   ①今日の見通しに🔄（今週よく回されている）を表示し、見通しに+3.5%（下位は-2.4%）。
+//   ②ピックアップの学習パターン「今週いつもより回されている／いない」を追加（バックテストAUC 0.580→0.581とわずか。
+//     オススメの週は機種の台がまとめて上がる形で、台の順位はつかないため）。
+export const APP_VERSION = "0.4.4";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -817,7 +824,7 @@ export function buildSymbolContext(pageDays, opts) {
   const p80 = quantile(readingsForPct, 0.8);
   // 記号（§4-2）：読み取りの階層（p20/p50/p80）× 差枚
   machines.forEach((m) => m.recs.forEach((r) => { r.sym = classifySymbol(r, { p20, p50, p80 }); }));
-  return { dates, gapBefore, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length, model30, storeLevel: o.storeLevel || null };
+  return { dates, gapBefore, machines, p20, p50, p80, eventsOn, isStrong, isSemi, targetsOn, modelCtx, sampleCount: readingsForPct.length, model30, storeLevel: o.storeLevel || null, weekPlay: o.weekPlay || null };
 }
 export function classifySymbol(r, p) {
   if (!r.enough || r.reading === null || p.p20 === null || r.s === null || r.s === undefined) return "－";
@@ -926,6 +933,9 @@ export function patternKeysAt(ctx, m, i, target) {
     if (dg >= 2000) add("gUp", "前日のG数が前々日より2000G以上増加");
     else if (dg <= -2000) add("gDown", "前日のG数が前々日より2000G以上減少");
   }
+  const wp = ctx.weekPlay ? ctx.weekPlay(m.modelKey, target) : null;
+  if (wp === "hot") add("weekHot", "今週いつもより回されている機種（オススメっぽい）");
+  else if (wp === "cold") add("weekCold", "今週いつもより回されていない機種");
   const st = ctx.storeLevel ? ctx.storeLevel(d) : null;
   if (st === "hi") add("store3hi", "店の直近3日が出ている（上位25%）");
   else if (st === "lo") add("store3lo", "店の直近3日が出ていない（下位25%）");
@@ -1127,6 +1137,47 @@ export const PICKUP_RELIABILITY = {
   "L東京喰種": "喰種は点数による勝率の差がほぼ出ていません（10/25時点のバックテストで S 43%〜E 35%、いつも41%。台・日とも予想が当たらない状態）。台選びより、木曜・勇者たまピーなど日の候補を参考にしてください。",
   "スロット ソードアート・オンラインⅡ": "SAO2は点数による勝率の差が出ていません（10/25時点のバックテストで S〜E すべて34〜38%）。3のつく日・極誓は弱い、1001番は全期間で勝率50%、という分かっていることを参考にしてください。",
 };
+// v0.4.4：その週（月曜始まり）の、前日までの「回され方」。店が1週間ごとにオススメ機種を変えているため。
+//   回され方＝log(機種の平均G ÷ その日の店全体の平均G) から、機種のいつもとその日の全体を差し引いたもの。
+//   予想日より前の同じ週の日だけで平均（月曜は前の週の情報を使わない）。上位20%＝hot・下位20%＝cold。
+export function weekStartOf2(d) { const x = new Date(d + "T00:00:00Z"); const k = (x.getUTCDay() + 6) % 7; x.setUTCDate(x.getUTCDate() - k); return x.toISOString().slice(0, 10); }
+export function buildWeekPlay(ovrByDate, resolve) {
+  const R = resolve || ((x) => x);
+  const dates = Object.keys(ovrByDate || {}).sort();
+  const gi = new Map(); // date -> Map(key -> value)
+  const sum = new Map(), cnt = new Map();
+  dates.forEach((d) => {
+    const rows = (ovrByDate[d].modelRows || []).filter((r) => !r.isVariety && r.total >= 3 && r.avgGsu > 0);
+    let G = 0, N = 0; rows.forEach((r) => { G += r.avgGsu * r.total; N += r.total; });
+    if (!N) return;
+    const m = new Map();
+    rows.forEach((r) => { const k = R(r.name); const v = Math.log(r.avgGsu / (G / N)); m.set(k, v); sum.set(k, (sum.get(k) || 0) + v); cnt.set(k, (cnt.get(k) || 0) + 1); });
+    gi.set(d, m);
+  });
+  // 機種のいつもを引き、その日の全体を引く
+  gi.forEach((m) => {
+    m.forEach((v, k) => m.set(k, v - sum.get(k) / cnt.get(k)));
+    const vals = [...m.values()]; const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    m.forEach((v, k) => m.set(k, v - mean));
+  });
+  const cache = new Map();
+  const priorOf = (k, target) => {
+    const ck = `${k}@${target}`;
+    if (cache.has(ck)) return cache.get(ck);
+    const ws = weekStartOf2(target); let t = 0, n = 0;
+    for (let x = ws; x < target; x = addDays(x, 1)) { const v = gi.get(x) && gi.get(x).get(k); if (v !== undefined) { t += v; n += 1; } }
+    const out = n ? t / n : null;
+    cache.set(ck, out);
+    return out;
+  };
+  // しきい値：過去の「前日までの週平均」の分布（上位20%・下位20%）
+  const all = [];
+  dates.forEach((d) => { const m = gi.get(d); if (!m) return; m.forEach((_, k) => { const p = priorOf(k, d); if (p !== null) all.push(p); }); });
+  all.sort((a, b) => a - b);
+  const hi = all.length >= 50 ? quantile(all, 0.8) : null, lo = all.length >= 50 ? quantile(all, 0.2) : null;
+  const level = (k, target) => { if (hi === null) return null; const p = priorOf(k, target); return p === null ? null : p >= hi ? "hot" : p <= lo ? "cold" : null; };
+  return { priorOf, level, hi, lo };
+}
 export const SHUYAKU_MIN_N = 7;
 export const SHUYAKU_MIN_RATE = 0.8;
 export const SHUYAKU_MIN_AVG = 1000;
@@ -1137,7 +1188,7 @@ export function shuyakuOf(day, resolve) {
 }
 
 // 見通しの本体。target＝見たい日（その日より前の民レポだけを使う）
-export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve }) {
+export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekPlay }) {
   const dates = Object.keys(ovr || {}).filter((d) => d < target).sort();
   if (dates.length < 10) return null;
   const R = resolve || ((x) => x);
@@ -1199,6 +1250,13 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve }) {
     const r30 = dsAll.length >= 20 ? recentRate(30) : null, r3 = recentRate(3);
     if (r30 !== null) { est += 0.4 * (r30 - base); parts.push({ label: "直近30日の勢い", rate: r30, days: Math.min(30, dsAll.length), diff: r30 - base }); }
     if (r3 !== null) { est += 0.2 * (r3 - base); parts.push({ label: "直近3日", rate: r3, days: Math.min(3, dsAll.length), diff: r3 - base }); }
+    // v0.4.4：今週（月曜から前日まで）いつもより回されているか。10/28の検証で、上位20%の機種は残りの日の勝率がいつもより+3.5%（下位20%は-2.4%）
+    let week = null;
+    if (weekPlay) {
+      const lv = weekPlay.level(k, target); const pv = weekPlay.priorOf(k, target);
+      if (lv === "hot") est += 0.035; else if (lv === "cold") est -= 0.024;
+      if (pv !== null) week = { level: lv, pct: Math.exp(pv) - 1 };
+    }
     // イベント対象機種（3*3など）：過去に対象だった日の成績
     const isTarget = isTargetOn ? isTargetOn(target, k) : false;
     let targetPart = null;
@@ -1229,7 +1287,7 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve }) {
         balance = { r, cur, pos, n: xs.length };
       }
     }
-    models.push({ key: k, name: names[k], total: latest.total, base, est: Math.max(0.02, Math.min(0.98, est)), parts, isTarget, targetPart, shuyaku: shuyakuCount[k] || 0, balance });
+    models.push({ key: k, name: names[k], total: latest.total, base, est: Math.max(0.02, Math.min(0.98, est)), parts, isTarget, targetPart, shuyaku: shuyakuCount[k] || 0, balance, week });
   });
   models.sort((a, b) => b.est - a.est);
   // 店の直近3日
@@ -1536,6 +1594,7 @@ export default function App() {
   })), [rawDates, raw, noModel, ovr, resolve]);
   const gtypeOf = useCallback((mk) => gtypeOfEntry(gtypes[mk]), [gtypes]);
   const storeLevelFn = useMemo(() => buildStoreLevel(ovr).fn, [ovr]);
+  const weekPlay = useMemo(() => buildWeekPlay(ovr, resolve), [ovr, resolve]);
   const profileByKey = useMemo(() => {
     const m = {};
     Object.keys(SETTING_PROFILES).forEach((n) => { m[resolve(n)] = SETTING_PROFILES[n]; });
@@ -2177,11 +2236,11 @@ export default function App() {
   }, [viewMode, currentPage, pageNameKeys, allDays, resolve, displayNameOf]);
   const engine = useMemo(() => {
     if (!pageDays.length) return null;
-    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet, closedSet, storeLevel: storeLevelFn });
+    const ctx = buildSymbolContext(pageDays, { profileOf: (mk) => profileByKey[mk] || null, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, noDataSet, closedSet, storeLevel: storeLevelFn, weekPlay: weekPlay.level });
     const learned = learnSymbolPatternWeights(ctx);
     const pick = scoreSymbolPickupToday(ctx, learned, closedSet, skipTargetSet);
     return { ctx, learned, pick };
-  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet, storeLevelFn]);
+  }, [pageDays, profileByKey, gtypeOf, eventsOn, isStrong, isSemi, targetsOn, closedSet, noDataSet, skipTargetSet, storeLevelFn, weekPlay]);
   const isMultiModel = useMemo(() => new Set(pageDays.flatMap((d) => d.machines.map((m) => m.modelKey))).size > 1, [pageDays]);
   const machineLabel = (m) => (isMultiModel ? `${m.model} ${m.no}番` : `${m.no}番`);
 
@@ -2427,8 +2486,8 @@ export default function App() {
   const [outlookAll, setOutlookAll] = useState(false);
   const outlook = useMemo(() => {
     if (viewMode !== "overall" || !effOutlookDate) return null;
-    try { return buildOutlook({ ovr, target: effOutlookDate, eventsOn, isTargetOn, resolve }); } catch (e) { return null; }
-  }, [viewMode, ovr, effOutlookDate, eventsOn, isTargetOn, resolve]);
+    try { return buildOutlook({ ovr, target: effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay }); } catch (e) { return null; }
+  }, [viewMode, ovr, effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay]);
   // ---- イベントを選んで過去を見る（v0.2.2）----
   const [evHist, setEvHist] = useState("");
   const allEventNames = useMemo(() => {
@@ -3008,11 +3067,12 @@ export default function App() {
                       return (
                         <div key={m.key} style={{ background: "#12161d", border: `1px solid ${d >= 0.08 ? "#4a5a2a" : d <= -0.08 ? "#5a2a33" : "#232b37"}`, borderRadius: 6, padding: "7px 9px" }}>
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
-                            <span>{m.isTarget && <span style={{ color: "#e8b34c" }}>🎯</span>}{m.shuyaku > 0 && <span style={{ color: "#f2d24b" }}>👑{m.shuyaku}</span>} {m.name}<span style={{ color: "#5a6272" }}>（{m.total}台）</span></span>
+                            <span>{m.isTarget && <span style={{ color: "#e8b34c" }}>🎯</span>}{m.week && m.week.level === "hot" && <span>🔄</span>}{m.shuyaku > 0 && <span style={{ color: "#f2d24b" }}>👑{m.shuyaku}</span>} {m.name}<span style={{ color: "#5a6272" }}>（{m.total}台）</span></span>
                             <span className="mono">見通し <b style={{ color: d >= 0.05 ? "#9ece6a" : d <= -0.05 ? "#e5697a" : "#c7cbd4" }}>{Math.round(m.est * 100)}%</b><span style={{ color: "#5a6272" }}>　いつも{Math.round(m.base * 100)}%</span></span>
                           </div>
                           <div style={{ fontSize: 11, color: "#8b93a3", marginTop: 3, lineHeight: 1.7 }}>
                             {m.parts.map((p) => <span key={p.label} style={{ marginRight: 8, display: "inline-block", color: p.diff >= 0.05 ? "#9ece6a" : p.diff <= -0.05 ? "#e5697a" : "#8b93a3" }}>{p.label} {Math.round(p.rate * 100)}%（{p.days}日）</span>)}
+                            {m.week && m.week.level && <span style={{ marginRight: 8, display: "inline-block", color: m.week.level === "hot" ? "#9ece6a" : "#e5697a" }}>{m.week.level === "hot" ? "🔄今週よく回されている（オススメっぽい）" : "今週あまり回されていない"} {m.week.pct >= 0 ? "+" : ""}{Math.round(m.week.pct * 100)}%</span>}
                             {m.targetPart && <span style={{ marginRight: 8, display: "inline-block", color: "#e8b34c" }}>🎯対象の日 {Math.round(m.targetPart.rate * 100)}%（{m.targetPart.days}日）</span>}
                             {m.balance && m.balance.pos !== "mid" && <span style={{ display: "inline-block", color: m.balance.pos === "lo" ? "#9ece6a" : "#e5697a" }}>⚖️直近30日が{m.balance.pos === "lo" ? "悪い→戻りやすい" : "良い→締めやすい"}（この機種で相関{m.balance.r.toFixed(2)}）</span>}
                           </div>
