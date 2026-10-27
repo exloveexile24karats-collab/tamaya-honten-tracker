@@ -123,7 +123,13 @@ import { storage } from "./storage";
 //     喰種のRBはCZ回数。民レポの代用データは総回転なので通常時に換算（×ratio）。事前の見込みは強い日20%・普通の日10%（仮）。
 //   ②全体データに「📱 昼の見極め」：機種・G数・初当たり回数から設定4以上の見込みと「見切り候補」をその場で計算。
 //   ③SAO2の追跡：強い日の予想で、前回の強い日に差枚上位1/4だった台に🔍印（ランクは変えない。強い日10回分で確かめる）。
-export const APP_VERSION = "0.4.9";
+// v0.4.10: 引き継ぎメモv3（10/28）を手元で再現してから反映（LightGBM 52.2%・線形版52.5%とも一致）。
+//   ①今日の見通しを「学習モデル」（線形版＝Ridge、buildLinearOutlook）に置き換え。係数は固定せず前日までの民レポで毎回学び直す。
+//     同じ124日で比べて毎日1位の機種の勝率（5台以上）：旧方式49.1%（後半46.9）→アプリ版52.3%（前半52.7／後半51.9）。3〜4台を含めると58.1%（旧57.8%）。
+//     ピックアップの予想勝率もこの数字を使う（台のランク S62/A50/B44/C41/D38/E33%、旧 S62/A50/B43/C41/D38/E32%）。
+//     ⭐店のオススメ（登録）だけはモデルに入っていないので上乗せ。旧方式の数字は「旧」として表示、内訳は参考に残す。
+//   ②強い日（8・2）は北斗・吉宗に💪（強い日に初当たりが良くなるAT機。北斗+6.2%・吉宗+5.2%、前半後半とも同じ向き）。
+export const APP_VERSION = "0.4.10";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -1246,8 +1252,111 @@ export function shuyakuOf(day, resolve) {
     .map((r) => ({ key: resolve(r.name), name: r.name, wins: r.wins, total: r.total, avg: r.avgSada }));
 }
 
+// v0.4.10：見通しの「学習モデル」（v3メモ§5の線形版＝Ridge回帰）。係数は固定せず、予想日より前の民レポだけで毎回学び直す。
+//   単位は（日, 機種）・その日3台以上（v3は5台以上）。目標はその機種のその日の勝率。材料は全部「その日より前」から作る。
+//   10/28の検証（6/17〜10/26、前日までで学習、毎日1位の機種の勝率）：5台以上の機種 52.3%（前半52.7／後半51.9）、旧見通し49.1%（後半46.9）。
+//   3〜4台の機種も含めると 58.1%（旧57.8%）。少ない台数の機種は勝率が大きく振れるので、新旧とも高く出る。
+export const LIN_MIN_DATES = 45;
+// v0.4.10：強い日（8・2のつく日）に初当たりが良くなるAT機（v3メモ§6、10/28に手元で再確認。日単位のブートストラップ95%範囲）
+//   スマスロ北斗の拳 +6.2%（+2〜+11%、前半+2.7／後半+12.7）、真打 吉宗 +5.2%（+2〜+8%、前半+6.2／後半+4.1）。
+//   カバネリ+1.7%・モンキー+1.6%・喰種+0.3%・北斗転生2 −0.8%は偶然と区別がつかない。
+export const STRONG_HIT_MODELS = [
+  { match: /^(?!.*転生).*北斗の拳/, label: "強い日は初当たり+6%（前半後半とも↑）" },
+  { match: /吉宗/, label: "強い日は初当たり+5%（前半後半とも↑）" },
+];     // 学習に使う日数がこれ未満なら使わない（旧見通しのまま）
+export const LIN_ALPHA = 10;
+export let LIN_MIN_N = 3;           // 学習に使う（日, 機種）の最少台数。v3は5台だが、見通しに並ぶ3〜4台の機種も同じ物差しにするため3（5台以上の予想は相関0.995で変わらない）
+export function setLinMinN(v) { LIN_MIN_N = v; } // テスト用
+export const LIN_HERO = 0.65;        // 主役日（機種の勝率65%以上）
+export const LIN_SHRINK = 5;         // イベント別・末尾別・曜日別の過去勝率を、いつもの勝率へ5日分縮める
+function linSolve(A, b) { // ガウスの消去法（対称正定値）
+  const n = b.length; const M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    [M[c], M[p]] = [M[p], M[c]];
+    const v = M[c][c]; if (Math.abs(v) < 1e-12) continue;
+    for (let r = 0; r < n; r++) { if (r === c) continue; const f = M[r][c] / v; if (!f) continue; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
+  }
+  return M.map((r, i) => (Math.abs(r[i]) < 1e-12 ? 0 : r[n] / r[i]));
+}
+export function buildLinearOutlook({ ovr, target, eventsOn, isStrong, isTargetOn, resolve }) {
+  const R = resolve || ((x) => x);
+  const strongOf = isStrong || ((d) => eventsOn(d).some((e) => /8のつく日|2のつく日/.test(e)));
+  const dates = Object.keys(ovr || {}).filter((d) => d < target).sort();
+  if (dates.length < LIN_MIN_DATES) return null;
+  const allD = [...dates, target];
+  // 店全体の直近3日（その日より前）
+  const dayAvg = dates.map((d) => ovrDayAvg(ovr[d]));
+  const store3Of = {};
+  allD.forEach((d, i) => { const w = dayAvg.slice(Math.max(0, i - 3), i).filter((v) => v !== null); store3Of[d] = w.length ? w.reduce((a, b) => a + b, 0) / w.length : null; });
+  // 機種ごとの日別
+  const series = new Map();
+  dates.forEach((d) => (ovr[d].modelRows || []).forEach((r) => {
+    if (r.isVariety || !r.total || r.total < LIN_MIN_N || r.wins === null || r.wins === undefined) return;
+    const k = R(r.name); if (!series.has(k)) series.set(k, []);
+    series.get(k).push({ d, wr: r.wins / r.total, n: r.total, sada: r.avgSada ?? 0, g: r.avgGsu > 0 ? r.avgGsu : null });
+  }));
+  const evNames = new Set(); dates.forEach((d) => eventsOn(d).forEach((e) => evNames.add(e)));
+  const EV = [...evNames];
+  const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+  const isMT = (d) => { const w = weekdayOf(d); return w === 1 || w === 2; };
+  const rowFeat = (k, rows, i, d, nNow) => { // rows[0..i-1] が過去、d がその日
+    const past = rows.slice(0, i); const wrs = past.map((x) => x.wr);
+    const wr_all = mean(wrs); const base = wr_all ?? 0.4;
+    const win = (m, mp) => (wrs.length >= mp ? mean(wrs.slice(-m)) : null);
+    const wr_30 = win(30, 5), wr_7 = win(7, 3), wr_3 = win(3, 1);
+    const gs = past.map((x) => x.g).filter((v) => v !== null); const g_all = mean(gs);
+    const prev = past[past.length - 1];
+    let since = null; for (let j = past.length - 1; j >= 0; j--) if (past[j].wr >= LIN_HERO) { since = past.length - j; break; }
+    const ctx = (match) => { let s = 0, n = 0; past.forEach((x) => { if (match(x.d)) { s += x.wr; n += 1; } }); return (s + LIN_SHRINK * base) / (n + LIN_SHRINK); };
+    const dd = parseInt(d.slice(8, 10), 10) % 10, wd = weekdayOf(d), st = strongOf(d);
+    const ev1 = eventsOn(d)[0] || "";
+    let mt_rel = null;
+    if (!isMT(d) && g_all) { const ws = weekStartOf2(d); const mt = past.filter((x) => x.d >= ws && isMT(x.d) && x.g !== null).map((x) => x.g); if (mt.length) mt_rel = mean(mt) / g_all; }
+    const f = {
+      n: nNow, hist_n: past.length, wr_all, wr_30, wr_7, wr_3, wr_1: prev ? prev.wr : null,
+      sada_3: past.length ? mean(past.slice(-3).map((x) => x.sada)) : null,
+      g_rel1: prev && prev.g !== null && g_all ? prev.g / g_all : null,
+      mom30: wr_30 !== null && wr_all !== null ? wr_30 - wr_all : null,
+      mom3: wr_3 !== null && wr_all !== null ? wr_3 - wr_all : null,
+      since_hero: since,
+      wr_dow: ctx((x) => weekdayOf(x) === wd), wr_dd: ctx((x) => parseInt(x.slice(8, 10), 10) % 10 === dd),
+      wr_strong: ctx((x) => strongOf(x) === st), wr_ev: ctx((x) => (eventsOn(x)[0] || "") === ev1),
+      store3: store3Of[d], mt_rel, strong: st ? 1 : 0, ev_target: isTargetOn && isTargetOn(d, k) ? 1 : 0,
+    };
+    const evs = new Set(eventsOn(d)); EV.forEach((e) => { f[`ev_${e}`] = evs.has(e) ? 1 : 0; });
+    return f;
+  };
+  const train = [], test = [];
+  series.forEach((rows, k) => {
+    rows.forEach((x, i) => { if (i >= 1) train.push({ k, d: x.d, y: x.wr, w: x.n, f: rowFeat(k, rows, i, x.d, x.n) }); });
+    const last = rows[rows.length - 1];
+    if (last && last.d === dates[dates.length - 1] && rows.length >= 2) test.push({ k, f: rowFeat(k, rows, rows.length, target, last.n) });
+  });
+  if (train.length < 200 || !test.length) return null;
+  const keys = Object.keys(train[0].f);
+  // 欠けは中央値で埋め、標準化（重み＝台数）
+  const med = {}, mu = {}, sd = {};
+  keys.forEach((c) => { const v = train.map((t) => t.f[c]).filter((x) => x !== null && x !== undefined && Number.isFinite(x)).sort((a, b) => a - b); med[c] = v.length ? v[Math.floor(v.length / 2)] : 0; });
+  const val = (f, c) => { const x = f[c]; return x === null || x === undefined || !Number.isFinite(x) ? med[c] : x; };
+  const W = train.reduce((a, t) => a + t.w, 0);
+  keys.forEach((c) => { let m = 0; train.forEach((t) => { m += t.w * val(t.f, c); }); m /= W; let v = 0; train.forEach((t) => { v += t.w * (val(t.f, c) - m) ** 2; }); mu[c] = m; sd[c] = Math.sqrt(v / W); });
+  const cols = keys.filter((c) => sd[c] > 1e-9);
+  const yM = train.reduce((a, t) => a + t.w * t.y, 0) / W;
+  const p = cols.length; const A = Array.from({ length: p }, () => new Array(p).fill(0)); const b = new Array(p).fill(0);
+  const z = (f) => cols.map((c) => (val(f, c) - mu[c]) / sd[c]);
+  // sklearn の Ridge（sample_weight あり）と同じ：重み付きで中心化し、罰則は alpha×|β|²
+  train.forEach((t) => { const x = z(t.f); const ry = t.y - yM; for (let i = 0; i < p; i++) { b[i] += t.w * x[i] * ry; for (let j = i; j < p; j++) A[i][j] += t.w * x[i] * x[j]; } });
+  for (let i = 0; i < p; i++) { for (let j = 0; j < i; j++) A[i][j] = A[j][i]; A[i][i] += LIN_ALPHA; }
+  const beta = linSolve(A, b);
+  const pred = new Map();
+  test.forEach((t) => { const x = z(t.f); let v = yM; for (let i = 0; i < p; i++) v += beta[i] * x[i]; pred.set(t.k, Math.max(0.02, Math.min(0.98, v))); });
+  const coef = cols.map((c, i) => ({ c, b: beta[i] })).sort((a, b) => Math.abs(b.b) - Math.abs(a.b));
+  return { pred, days: dates.length, rows: train.length, coef };
+}
+
 // 見通しの本体。target＝見たい日（その日より前の民レポだけを使う）
-export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap }) {
+export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap, isStrong }) {
   const dates = Object.keys(ovr || {}).filter((d) => d < target).sort();
   if (dates.length < 10) return null;
   const R = resolve || ((x) => x);
@@ -1360,6 +1469,16 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekP
     }
     models.push({ key: k, name: names[k], total: latest.total, base, est: Math.max(0.02, Math.min(0.98, est)), parts, isTarget, targetPart, shuyaku: shuyakuCount[k] || 0, balance, week, isRec });
   });
+  // v0.4.10：学習モデル（線形版）があれば見通しをそれに置き換える。⭐店のオススメ（登録）はモデルに入っていないので上乗せ
+  let linear = null;
+  try { linear = buildLinearOutlook({ ovr, target, eventsOn, isStrong, isTargetOn, resolve }); } catch (e) { linear = null; }
+  const strongTarget = (isStrong || ((d) => eventsOn(d).some((e) => /8のつく日|2のつく日/.test(e))))(target);
+  models.forEach((m) => {
+    m.estOld = m.est;
+    if (linear && linear.pred.has(m.key)) { m.est = Math.max(0.02, Math.min(0.98, linear.pred.get(m.key) + (m.isRec ? recLift : 0))); m.lin = true; }
+    const sh = STRONG_HIT_MODELS.find((x) => x.match.test(m.name || m.key));
+    m.strongHit = strongTarget && sh ? sh : null;
+  });
   models.sort((a, b) => b.est - a.est);
   // 店の直近3日
   const sl = buildStoreLevel(Object.fromEntries(dates.map((d) => [d, ovr[d]])));
@@ -1380,7 +1499,7 @@ export function buildOutlook({ ovr, target, eventsOn, isTargetOn, resolve, weekP
     if (i + 1 < dates.length) { const r2 = ovr[dates[i + 1]].modelRows.find((x) => R(x.name) === R(r.name)); if (r2 && r2.total) { nDay2w += r2.wins || 0; nDay2t += r2.total; } }
   });
   const newMachine = nn >= 3 ? { models: nn, rate: nt ? nw / nt : null, avg: ns / nn, nextRate: nDay2t ? nDay2w / nDay2t : null } : null;
-  return { rec: { lift: recLift, measured: recMeasured, days: recDays, registered: targetRec.size }, target, lastDate, events: tEvents, conds: conds.map((c, i) => ({ label: c.label, days: condDays[i].size })), models, shuyakuHistory, store, newMachine };
+  return { linear: linear ? { days: linear.days, rows: linear.rows, coef: linear.coef.slice(0, 6) } : null, strongTarget, rec: { lift: recLift, measured: recMeasured, days: recDays, registered: targetRec.size }, target, lastDate, events: tEvents, conds: conds.map((c, i) => ({ label: c.label, days: condDays[i].size })), models, shuyakuHistory, store, newMachine };
 }
 
 const EVENT_DELIMITER = "、";
@@ -2337,7 +2456,7 @@ export default function App() {
     const pick = scoreSymbolPickupToday(ctx, learned, closedSet, skipTargetSet);
     // v0.4.6：予想勝率（機種の見通し＋台の点数）でランク付け
     let ol = null;
-    try { if (pick.target) ol = buildOutlook({ ovr, target: pick.target, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap }); } catch (e) { ol = null; }
+    try { if (pick.target) ol = buildOutlook({ ovr, target: pick.target, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap, isStrong }); } catch (e) { ol = null; }
     const estOf = new Map(ol ? ol.models.map((x) => [x.key, x]) : []);
     pick.list.forEach((it) => {
       const mk = ctx.machines.get(it.key) ? ctx.machines.get(it.key).modelKey : null;
@@ -2609,8 +2728,8 @@ export default function App() {
   const [noonStrong, setNoonStrong] = useState(true);
   const outlook = useMemo(() => {
     if (viewMode !== "overall" || !effOutlookDate) return null;
-    try { return buildOutlook({ ovr, target: effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap }); } catch (e) { return null; }
-  }, [viewMode, ovr, effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap]);
+    try { return buildOutlook({ ovr, target: effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap, isStrong }); } catch (e) { return null; }
+  }, [viewMode, ovr, effOutlookDate, eventsOn, isTargetOn, resolve, weekPlay, weekRecMap, isStrong]);
   // ---- イベントを選んで過去を見る（v0.2.2）----
   const [evHist, setEvHist] = useState("");
   const allEventNames = useMemo(() => {
@@ -3200,20 +3319,23 @@ export default function App() {
                       {h.days.length > 8 && <div style={{ fontSize: 11, color: "#5a6272" }}>ほか{h.days.length - 8}回（主役あり{h.days.slice(8).filter((x) => x.list.length).length}回）</div>}
                     </div>
                   ))}
-                  <div style={{ fontSize: 11, color: "#8b93a3", margin: "4px 0 6px", lineHeight: 1.6 }}>⭐店のオススメ：{outlook.rec.registered ? `この週は${outlook.rec.registered}機種を登録済み` : "この週はまだ登録なし（共通設定で登録）"}。見通しに{outlook.rec.lift >= 0 ? "+" : ""}{(outlook.rec.lift * 100).toFixed(1)}%（{outlook.rec.measured === null ? "まだ登録の実績が無いので10/28の分析値+5%" : `登録した週の実績${outlook.rec.measured >= 0 ? "+" : ""}${(outlook.rec.measured * 100).toFixed(1)}%・${outlook.rec.days}機種日を反映`}）。🔄＝今週（月曜から前日まで）いつもより回されている機種（データからの推測、+3.5%）。</div>
-                  <div style={{ fontSize: 11, color: "#8b93a3", margin: "4px 0 6px" }}>見通し＝その機種のいつもの勝率に、今日の条件（{outlook.conds.map((c) => `${c.label}${c.days}日`).join("・")}{" "}／🎯対象）で過去どうだったかを日数に応じて足したもの。勝率＝差枚プラスの台の割合。</div>
+                  <div style={{ fontSize: 11, color: "#8b93a3", margin: "4px 0 6px", lineHeight: 1.6 }}>⭐店のオススメ：{outlook.rec.registered ? `この週は${outlook.rec.registered}機種を登録済み` : "この週はまだ登録なし（共通設定で登録）"}。見通しに{outlook.rec.lift >= 0 ? "+" : ""}{(outlook.rec.lift * 100).toFixed(1)}%（{outlook.rec.measured === null ? "まだ登録の実績が無いので10/28の分析値+5%" : `登録した週の実績${outlook.rec.measured >= 0 ? "+" : ""}${(outlook.rec.measured * 100).toFixed(1)}%・${outlook.rec.days}機種日を反映`}）。🔄＝今週（月曜から前日まで）いつもより回されている機種（データからの推測{outlook.linear ? "。学習モデルの材料に含む" : "、+3.5%"}）。</div>
+                  {outlook.linear ? <div style={{ fontSize: 11, color: "#8b93a3", margin: "0 0 6px", lineHeight: 1.6 }}>🧮見通し＝学習モデル（前日までの{outlook.linear.days}日・{outlook.linear.rows}件から毎回学び直し）。材料：機種のいつもの勝率・直近30/7/3日・前日・イベント別/末尾別/曜日別/強い日別の過去勝率・店全体の直近3日・前日の稼働・月火の回され方・3*3の対象など。10/28の検証（前日までで予想）で、5台以上の機種の中の毎日1位の勝率は52%（前半53／後半52%）、旧方式は49%（後半47%）。3〜4台の機種は勝率が大きく振れます。「旧」は前のやり方の数字、下の内訳は参考。{outlook.strongTarget ? "💪＝強い日に初当たりが良くなるAT機（北斗・吉宗）。" : ""}</div>
+                    : <div style={{ fontSize: 11, color: "#5a6272", margin: "0 0 6px" }}>（データが{LIN_MIN_DATES}日分たまるまでは旧方式の見通しです）</div>}
+                  <div style={{ fontSize: 11, color: "#8b93a3", margin: "4px 0 6px" }}>{outlook.linear ? "旧" : ""}見通し＝その機種のいつもの勝率に、今日の条件（{outlook.conds.map((c) => `${c.label}${c.days}日`).join("・")}{" "}／🎯対象）で過去どうだったかを日数に応じて足したもの。勝率＝差枚プラスの台の割合。</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     {(outlookAll ? outlook.models : outlook.models.slice(0, 12)).map((m) => {
                       const d = m.est - m.base;
                       return (
                         <div key={m.key} style={{ background: "#12161d", border: `1px solid ${d >= 0.08 ? "#4a5a2a" : d <= -0.08 ? "#5a2a33" : "#232b37"}`, borderRadius: 6, padding: "7px 9px" }}>
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
-                            <span>{m.isRec && <span>⭐</span>}{m.isTarget && <span style={{ color: "#e8b34c" }}>🎯</span>}{m.week && m.week.level === "hot" && <span>🔄</span>}{m.shuyaku > 0 && <span style={{ color: "#f2d24b" }}>👑{m.shuyaku}</span>} {m.name}<span style={{ color: "#5a6272" }}>（{m.total}台）</span></span>
-                            <span className="mono">見通し <b style={{ color: d >= 0.05 ? "#9ece6a" : d <= -0.05 ? "#e5697a" : "#c7cbd4" }}>{Math.round(m.est * 100)}%</b><span style={{ color: "#5a6272" }}>　いつも{Math.round(m.base * 100)}%</span></span>
+                            <span>{m.isRec && <span>⭐</span>}{m.strongHit && <span title={m.strongHit.label}>💪</span>}{m.isTarget && <span style={{ color: "#e8b34c" }}>🎯</span>}{m.week && m.week.level === "hot" && <span>🔄</span>}{m.shuyaku > 0 && <span style={{ color: "#f2d24b" }}>👑{m.shuyaku}</span>} {m.name}<span style={{ color: "#5a6272" }}>（{m.total}台）</span></span>
+                            <span className="mono">見通し <b style={{ color: d >= 0.05 ? "#9ece6a" : d <= -0.05 ? "#e5697a" : "#c7cbd4" }}>{Math.round(m.est * 100)}%</b><span style={{ color: "#5a6272" }}>　いつも{Math.round(m.base * 100)}%{m.lin && <span>　旧{Math.round(m.estOld * 100)}%</span>}</span></span>
                           </div>
                           <div style={{ fontSize: 11, color: "#8b93a3", marginTop: 3, lineHeight: 1.7 }}>
                             {m.parts.map((p) => <span key={p.label} style={{ marginRight: 8, display: "inline-block", color: p.diff >= 0.05 ? "#9ece6a" : p.diff <= -0.05 ? "#e5697a" : "#8b93a3" }}>{p.label} {Math.round(p.rate * 100)}%（{p.days}日）</span>)}
                             {m.isRec && <span style={{ marginRight: 8, display: "inline-block", color: "#f2d24b" }}>⭐店のオススメ（今週・登録）</span>}
+                            {m.strongHit && <span style={{ marginRight: 8, display: "inline-block", color: "#9ece6a" }}>💪{m.strongHit.label}</span>}
                             {m.week && m.week.level && <span style={{ marginRight: 8, display: "inline-block", color: m.week.level === "hot" ? "#9ece6a" : "#e5697a" }}>{m.week.level === "hot" ? "🔄今週よく回されている（オススメっぽい）" : "今週あまり回されていない"} {m.week.pct >= 0 ? "+" : ""}{Math.round(m.week.pct * 100)}%（月曜から{m.week.days}日分）</span>}
                             {m.targetPart && <span style={{ marginRight: 8, display: "inline-block", color: "#e8b34c" }}>🎯対象の日 {Math.round(m.targetPart.rate * 100)}%（{m.targetPart.days}日）</span>}
                             {m.balance && m.balance.pos !== "mid" && <span style={{ display: "inline-block", color: m.balance.pos === "lo" ? "#9ece6a" : "#e5697a" }}>⚖️直近30日が{m.balance.pos === "lo" ? "悪い→戻りやすい" : "良い→締めやすい"}（この機種で相関{m.balance.r.toFixed(2)}）</span>}
