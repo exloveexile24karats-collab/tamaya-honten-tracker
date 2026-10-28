@@ -133,7 +133,8 @@ import { storage } from "./storage";
 //   スプレッドシートの「ランク」タブに貼って Apps Script（SHEET_COLOR_SCRIPT）で配置図の台番のマスに色だけつける（S赤・Aオレンジ・B黄・C緑・D水色・E灰）。
 // v0.4.12: 「🎨 スプレッドシートに色付け」を共通設定の一番上に移動（ロック中でも使える。書き出すだけでデータは変えないため）。
 // v0.4.13: ピックアップの参考表示（PICKUP_RELIABILITY）を10/28の全11ページのバックテストで更新。北斗・乙女・VVV2・獣王・モンキー・VVVを追加。
-export const APP_VERSION = "0.4.13";
+// v0.4.14: ページ（タブ）の並び順を変えられるように。共通設定（解除後）の「📑 ページの並び順」で▲▼、各ページの編集欄に「◀ 左へ／右へ ▶」。
+export const APP_VERSION = "0.4.14";
 const UNLOCK_PIN = "5246";
 
 // ---- 保存キー（指示書 §4-4）----
@@ -2234,6 +2235,14 @@ export default function App() {
   async function updatePage(id, patch) {
     await commitKV(KEYS.pages, (prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
   }
+  // v0.4.14：ページ（タブ）の並び順を変える。dir＝-1で左（上）へ、+1で右（下）へ
+  async function movePage(id, dir) {
+    await commitKV(KEYS.pages, (prev) => {
+      const i = prev.findIndex((p) => p.id === id); const j = i + dir;
+      if (i < 0 || j < 0 || j >= prev.length) return prev;
+      const next = [...prev]; [next[i], next[j]] = [next[j], next[i]]; return next;
+    });
+  }
   async function deletePage(id) {
     const prev = kvRef.current[KEYS.pages];
     const r = await commitKV(KEYS.pages, (p) => p.filter((x) => x.id !== id));
@@ -3021,6 +3030,22 @@ export default function App() {
             </div>
           ) : (
             <>
+              {pages.length > 1 && (
+                <div style={S.card}>
+                  <div style={S.h}>📑 ページ（タブ）の並び順</div>
+                  <div style={S.note}>▲▼で入れ替えると、上のタブの並びがすぐ変わります（全員の画面に反映）。</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+                    {pages.map((pg, i) => (
+                      <div key={pg.id} style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 6px", border: "1px solid #2a323f", borderRadius: 6 }}>
+                        <span className="mono" style={{ width: 20, color: "#5a6272", fontSize: 12 }}>{i + 1}</span>
+                        <span style={{ flex: 1, minWidth: 0, fontSize: 13, color: "#c7cbd4", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pg.name || "（無題）"}</span>
+                        <button aria-label={`${pg.name}を上へ`} disabled={i === 0} onClick={() => movePage(pg.id, -1)} style={{ ...S.ghost, padding: "4px 12px", fontSize: 13, opacity: i === 0 ? 0.3 : 1 }}>▲</button>
+                        <button aria-label={`${pg.name}を下へ`} disabled={i === pages.length - 1} onClick={() => movePage(pg.id, 1)} style={{ ...S.ghost, padding: "4px 12px", fontSize: 13, opacity: i === pages.length - 1 ? 0.3 : 1 }}>▼</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {(suspiciousAliases.length > 0 || suspiciousNoMaps.length > 0) && (
                 <div style={{ ...S.card, borderColor: "#7a3038", background: "#24161a" }}>
                   <div style={{ ...S.h, color: "#e5697a" }}>⚠ 間違っている可能性が高い機種名の対応があります</div>
@@ -3611,6 +3636,8 @@ export default function App() {
                 <Pencil size={14} color="#5a6272" />
                 <input defaultValue={currentPage.name} key={`n-${currentPage.id}`} onBlur={(e) => e.target.value !== currentPage.name && updatePage(currentPage.id, { name: e.target.value })} placeholder="ページ名（例：マイジャグ）"
                   style={{ fontSize: 16, fontWeight: 700, background: "transparent", border: "none", borderBottom: "1px dashed #2a323f", color: "#e7e9ee", padding: "4px 2px", flex: "1 1 200px", minWidth: 0 }} />
+                <button style={S.ghost} disabled={pages[0] && pages[0].id === currentPage.id} onClick={() => movePage(currentPage.id, -1)} title="タブを左へ">◀ 左へ</button>
+                <button style={S.ghost} disabled={pages.length && pages[pages.length - 1].id === currentPage.id} onClick={() => movePage(currentPage.id, 1)} title="タブを右へ">右へ ▶</button>
                 <button style={{ ...S.ghost, color: "#e5697a" }} onClick={() => window.confirm("このページを削除しますか？（データ自体は消えません）") && deletePage(currentPage.id)}><Trash2 size={11} /> ページ削除</button>
               </div>
               <div style={{ fontSize: 11, color: "#5a6272", marginBottom: 6 }}>正式名称（アナスロ・民レポと連携。複数機種を束ねる場合は1つずつ追加）</div>
